@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy></createdBy>
+    <profile name="glassfish-jmx">
+        <description>A profiler for Glassfish which monitors thread and memory</description>
+        <provider type="jmx" name="glassfish">
+            <ipService host="localhost" port="8686" creds="admin:admin" />
+            <metricGroup name="jvm-memory">
+                <mbeanName>java.lang:type=Memory</mbeanName>
+                <metric name="ObjectPendingFinalizationCount" />
+                <compositeMetric name="HeapMemoryUsage">
+                    <metric name="committed" />
+                    <metric name="init" />
+                    <metric name="max" />
+                    <metric name="used" />
+                </compositeMetric>
+            </metricGroup>
+            <metricGroup name="threads">
+                <mbeanName>java.lang:type=Threading</mbeanName>
+                <metric name="ThreadCount" />
+                <metric name="PeakThreadCount" />
+            </metricGroup>
+        </provider>
+    </profile>
+</instr>

@@ -1,0 +1,169 @@
+#!/usr/bin/perl
+#####################################################################################
+# This script processes Radio Cell logs information
+# collected under /eniq/log/assureddc/radionode/cellCountFiles from DWHDB database
+#####################################################################################
+
+use strict;
+use warnings;
+
+#############################################################
+# Globals
+#############################################################
+
+our $dir = '/eniq/log/assureddc/radioNode/cellCountFiles';
+
+sub main {
+    opendir(DIR, $dir) or die "couldn't open $dir: $!\n";
+    my @files = readdir DIR;
+    closedir DIR;
+
+    my $GSMG1Count = 0;
+    my $GSMG2Count = 0;
+    my $GSMMixedCount = 0;
+    my $WCDMAG1Count = 0;
+    my $WCDMAG2Count = 0;
+    my $WCDMAMixedCount = 0;
+    my $LTEG1Count = 0;
+    my $LTEG2Count = 0;
+    my $LTEMixedCount = 0;
+    my $fiveGNRG1Count = 0;
+    my $fiveGNRG2Count = 0;
+    my $fiveGNRMixedCount = 0;
+    my $GSMG1NodeCount = 0;
+    my $GSMG2NodeCount = 0;
+    my $GSMMixedNodeCount = 0;
+    my $WCDMAG1NodeCount = 0;
+    my $WCDMAG2NodeCount = 0;
+    my $WCDMAMixedNodeCount = 0;
+    my $LTEG1NodeCount = 0;
+    my $LTEG2NodeCount = 0;
+    my $LTEMixedNodeCount = 0;
+    my $fiveGNRG1NodeCount = 0;
+    my $fiveGNRG2NodeCount = 0;
+    my $fiveGNRMixedNodeCount = 0;
+    my $WCDMARncCount = 0;
+    my $WCDMARncNodeCount = 0;
+    my $WCDMAPicoCount = 0;
+    my $WCDMAPicoNodeCount = 0;
+    my $LTEPicoCount = 0;
+    my $LTEPicoNodeCount = 0;
+
+    foreach my $file (@files) {
+        next if $file =~ /^\./;
+        if ( $file =~ /^radio_cell_(.*)_(.*)_count.txt/ ) {
+            my $technology = $1;
+            my $mode = $2;
+            if ($technology eq "GSM" && $mode eq "G1") {
+                ($GSMG1Count, $GSMG1NodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "GSM" && $mode eq "G2") {
+                ($GSMG2Count, $GSMG2NodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "GSM" && $mode eq "Mixed") {
+                ($GSMMixedCount, $GSMMixedNodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "WCDMA" && $mode eq "G1") {
+                ($WCDMAG1Count, $WCDMAG1NodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "WCDMA" && $mode eq "G2") {
+                ($WCDMAG2Count, $WCDMAG2NodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "WCDMA" && $mode eq "Mixed") {
+                ($WCDMAMixedCount, $WCDMAMixedNodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "WCDMA" && $mode eq "RNC") {
+                ($WCDMARncCount, $WCDMARncNodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "WCDMA" && $mode eq "PICO") {
+                ($WCDMAPicoCount, $WCDMAPicoNodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "LTE" && $mode eq "G1") {
+                ($LTEG1Count, $LTEG1NodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "LTE" && $mode eq "G2") {
+                ($LTEG2Count, $LTEG2NodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "LTE" && $mode eq "Mixed") {
+                ($LTEMixedCount, $LTEMixedNodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "LTE" && $mode eq "PICO") {
+                ($LTEPicoCount, $LTEPicoNodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "5GNR" && $mode eq "G1") {
+                ($fiveGNRG1Count, $fiveGNRG1NodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "5GNR" && $mode eq "G2") {
+                ($fiveGNRG2Count, $fiveGNRG2NodeCount) = parseCellCountLog($file);
+
+            } elsif ($technology eq "5GNR" && $mode eq "Mixed") {
+                ($fiveGNRMixedCount, $fiveGNRMixedNodeCount) = parseCellCountLog($file);
+
+            }
+        }
+    }
+
+    my $totalGSMCount = $GSMG1Count + $GSMG2Count + $GSMMixedCount;
+    my $totalWCDMACount = $WCDMAG1Count + $WCDMAG2Count + $WCDMAMixedCount;
+    my $totalLTEMixedCount = $LTEG1Count + $LTEG2Count + $LTEMixedCount;
+    my $total5GNRMixedCount = $fiveGNRG1Count + $fiveGNRG2Count + $fiveGNRMixedCount;
+
+    my $totalGSMNodeCount = $GSMG1NodeCount + $GSMG2NodeCount + $GSMMixedNodeCount;
+    my $totalWCDMANodeCount = $WCDMAG1NodeCount + $WCDMAG2NodeCount + $WCDMAMixedNodeCount;
+    my $totalLTEMixedNodeCount = $LTEG1NodeCount + $LTEG2NodeCount + $LTEMixedNodeCount;
+    my $total5GNRMixedNodeCount = $fiveGNRG1NodeCount + $fiveGNRG2NodeCount + $fiveGNRMixedNodeCount;
+
+    my $cellCountFile = "/tmp/radio_G1_G2_mixed_cell_count.txt";
+    open FILE, ">$cellCountFile" or die "Can't open file to read $cellCountFile";
+    if ( defined $totalGSMCount ) {
+        printf FILE "%s:%d:%d:%d:%d:%d:%d:%d:%d\n", "GSM", $GSMG1Count, $GSMG2Count, $GSMMixedCount, $totalGSMCount, $GSMG1NodeCount, $GSMG2NodeCount, $GSMMixedNodeCount, $totalGSMNodeCount;
+    }
+    if ( defined $totalWCDMACount ) {
+        printf FILE "%s:%d:%d:%d:%d:%d:%d:%d:%d\n", "WCDMA", $WCDMAG1Count, $WCDMAG2Count, $WCDMAMixedCount, $totalWCDMACount, $WCDMAG1NodeCount, $WCDMAG2NodeCount, $WCDMAMixedNodeCount, $totalWCDMANodeCount;
+    }
+    if ( defined $totalLTEMixedCount ) {
+        printf FILE "%s:%d:%d:%d:%d:%d:%d:%d:%d\n", "LTE", $LTEG1Count, $LTEG2Count, $LTEMixedCount, $totalLTEMixedCount, $LTEG1NodeCount, $LTEG2NodeCount, $LTEMixedNodeCount, $totalLTEMixedNodeCount;
+    }
+    if ( defined $total5GNRMixedCount ) {
+        printf FILE "%s:%d:%d:%d:%d:%d:%d:%d:%d\n", "5G NR", $fiveGNRG1Count, $fiveGNRG2Count, $fiveGNRMixedCount, $total5GNRMixedCount, $fiveGNRG1NodeCount, $fiveGNRG2NodeCount, $fiveGNRMixedNodeCount, $total5GNRMixedNodeCount;
+    }
+    close FILE;
+
+    my $LTERncCount = 0;
+    my $totalWCDMARncPicoCount = $WCDMAPicoCount + $WCDMARncCount;
+    my $totalLTERncPicoCount = $LTEPicoCount + $LTERncCount;
+
+    my $LTERncNodeCount = 0;
+    my $totalWCDMARncPicoNodeCount = $WCDMAPicoNodeCount + $WCDMARncNodeCount;
+    my $totalLTERncPicoNodeCount = $LTEPicoNodeCount + $LTERncNodeCount;
+
+    my $cellCountRncPicoFile = "/tmp/radio_pico_rnc_cell_count.txt";
+    open FILE, ">$cellCountRncPicoFile" or die "Can't open file to read $cellCountRncPicoFile";
+    if ( defined $totalWCDMARncPicoCount ) {
+        printf FILE "%s:%d:%d:%d:%d:%d:%d\n", "WCDMA", $WCDMAPicoCount, $WCDMARncCount, $totalWCDMARncPicoCount, $WCDMAPicoNodeCount, $WCDMARncNodeCount, $totalWCDMARncPicoNodeCount;
+    }
+    if ( defined $totalLTERncPicoCount ) {
+        printf FILE "%s:%d:%d:%d:%d:%d:%d\n", "LTE", $LTEPicoCount, $LTERncCount, $totalLTERncPicoCount, $LTEPicoNodeCount, $LTERncNodeCount, $totalLTERncPicoNodeCount;
+    }
+    close FILE;
+}
+
+sub parseCellCountLog {
+    my ($logFile) = @_;
+    my $cellCount = 0;
+    my $nodeCount = 0;
+    open FILE, "<$dir/$logFile" or die "Can't open file to read $logFile";
+    while (my $line = <FILE>) {
+        if ($line =~ /^;(.*);(.*);/) {
+            $cellCount = $1;
+            $nodeCount = $2;
+        } elsif ($line =~ /^;(.*);/) {
+            $cellCount = $1;
+        }
+    }
+    close FILE;
+
+    return ($cellCount, $nodeCount);
+}
+
+main();

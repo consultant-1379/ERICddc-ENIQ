@@ -1,0 +1,50 @@
+#!/usr/bin/perl
+##############################################################################
+#  Description --------- nodeHardeningDataCollection --------------------
+#  This script parses node hardening logs and stores data to JSON format
+##############################################################################
+
+use strict;
+use warnings;
+use JSON;
+
+sub main {
+    my $outputDir = "/eniq/log/assureddc/node_hardening";
+    if ( !(-d $outputDir) ) {
+        mkdir $outputDir;
+    }
+    my $nodeHardeningFile = "/ericsson/security/bin/node_hardening_summary.txt";
+    my @nodeHardeningArrayData = ();
+    if ( -e $nodeHardeningFile ) {
+        open FILE, "<$nodeHardeningFile" or die "Can't open file to read $nodeHardeningFile\n";
+        my $hardeningType;
+        while ( my $line = <FILE> ) {
+            if ( $line =~ /^(.*) Node Hardening Summary$/ ) {
+               $hardeningType = $1;
+            }
+            if ( $line =~ /^'(.*)',\s+'(.*)',\s+'(.*)'$/ ) {
+                my %nodeHardeningData = (
+                    featureName => $1,
+                    featureDescription => $2,
+                    status => $3
+                );
+                push(@nodeHardeningArrayData, \%nodeHardeningData);
+            }
+        }
+        close FILE;
+
+        if ( $#nodeHardeningArrayData > -1 ) {
+            my $hostName = `hostname`;
+            chomp $hostName;
+            my $serverType = `cat /eniq/installation/config/installed_server_type`;
+            chomp $serverType;
+            my $host_type = $hostName."-".$serverType;
+            my $json_data = encode_json \@nodeHardeningArrayData;
+            open(JSON, ">$outputDir/node_hardening_$hardeningType-$host_type.json") or die "cannot open file for reading: $!";
+            print JSON $json_data."\n";
+            close JSON;
+        }
+    }
+}
+
+main();

@@ -1,0 +1,80 @@
+#!/usr/bin/perl
+#####################################################################
+# This script processes OSS Integration Information
+#####################################################################
+
+use strict;
+use warnings;
+use JSON;
+
+sub main {
+    my $outputDir = "/eniq/log/assureddc/file_lookup_service";
+    if ( !(-d $outputDir) ) {
+        mkdir $outputDir;
+    }
+    my $ossIdentifierIPFile = "/eniq/connectd/mount_info/.oss_ref_name_file";
+    my @arrayOfOSSIndentifier = ();
+    my @arrayOfIPAddress = ();
+    my @r_arrayOfFLSDataHash = ();
+    if (-e $ossIdentifierIPFile) {
+        open FILE, "<$ossIdentifierIPFile" or die "Can't open file to read $ossIdentifierIPFile\n";
+        while (my $line = <FILE>) {
+            if ($line =~ /^(\w+)\s+(.*)$/) {
+                my $ossIdentifier = $1;
+                my $IPAddress = $2;
+                push (@arrayOfOSSIndentifier, $ossIdentifier);
+                push (@arrayOfIPAddress, $IPAddress);
+            }
+        }
+        close FILE;
+        for my $arrayIndex ( 0 .. $#arrayOfOSSIndentifier ) {
+            my $ossType = "";
+            my $integrationMode = "";
+            if (-e "/eniq/connectd/mount_info/$arrayOfOSSIndentifier[$arrayIndex]/enm_type") {
+                my $ossFile = `cat /eniq/connectd/mount_info/$arrayOfOSSIndentifier[$arrayIndex]/enm_type`;
+                chomp($ossFile);
+                if ($ossFile eq "cENM") {
+                    $ossType = "cENM";
+                    $integrationMode = "FLS";
+                }
+                elsif ($ossFile eq "vENM") {
+                    $ossType = "vENM";
+                    $integrationMode = "FLS";
+                }
+                else {
+                    my $ossTypeCount = `cat /eniq/connectd/mount_info/$arrayOfOSSIndentifier[$arrayIndex]/fs_mount_list | grep -w $arrayOfIPAddress[$arrayIndex] | wc -l`;
+                    my $integrationModeCount = `df -hk | grep -i $arrayOfOSSIndentifier[$arrayIndex] | egrep "pm1|pm2|pmlinks" | wc -l`;
+                    if ($ossTypeCount == 0 && $integrationModeCount == 3) {
+                        $ossType = "OSS-RC";
+                        $integrationMode = "Symlink";
+                    }
+                    elsif (($ossTypeCount >= 1) && ($integrationModeCount == 2 || $integrationModeCount == 3)) {
+                        $ossType = "pENM";
+                        if ($integrationModeCount == 2) {
+                            $integrationMode = "FLS";
+                        }
+                        elsif ($integrationModeCount == 3) {
+                            $integrationMode = "Symlink";
+                        }
+                    }
+                }
+                if ($ossType ne "" && $integrationMode ne "") {
+                    my %r_flsDataHash = (
+                        integrationMode => $integrationMode,
+                        ossIdentifier => $arrayOfOSSIndentifier[$arrayIndex],
+                        ossType => $ossType
+                    );
+                    push (@r_arrayOfFLSDataHash, \%r_flsDataHash);
+                }
+            }
+        }
+        if ($#r_arrayOfFLSDataHash > -1) {
+            my $json_fls_data = encode_json \@r_arrayOfFLSDataHash;
+            open(JSON, ">$outputDir/fls_oss_integration_mode.json") or die "cannot open file for reading: $!";
+            print JSON $json_fls_data."\n";
+            close JSON;
+        }
+    }
+}
+
+main();

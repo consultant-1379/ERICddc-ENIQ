@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>Ciaran Johnston</createdBy>
+    <!-- this is a template used to build a "proper" file to poll a kstat -->
+    <profile name="kstat-profile-60">
+        <description>A profiler for OSS_NAME which has instantiated a cslib instance</description>
+        <pollInterval>60</pollInterval>
+        <provider type="kstat" name="OUTPUT_NAME">
+            <metric name="" />
+            <metric name="" />
+            <metric name="" />
+            <metric name="" />
+            <metric name="" />
+            <metric name="" />
+            <metric name="" />
+            <metric name="" />
+            <metric name="" />
+            <metric name="" />
+            <metric name="" />
+            <metric name="" />
+        </provider>
+    </profile>
+</instr>

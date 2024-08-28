@@ -1,0 +1,281 @@
+#!/usr/bin/perl
+#####################################################################
+# This script processes RadioNode log information
+# collected under /eniq/log/assureddc/radionode from DWHDB database
+#####################################################################
+
+use strict;
+use warnings;
+use Data::Dumper;
+
+#############################################################
+# Globals
+#############################################################
+
+our @r_arrayOf2gHash = ();
+our @r_arrayOf3gHash = ();
+our @r_arrayOf4gHash = ();
+our @r_arrayOf5gHash = ();
+our @r_arrayOfAllHash = ();
+our @arrayOFMixedRadioNode = ();
+our @r_arrayOfSingleModeHash = ();
+our @r_arrayOfRadioNodeHash = ();
+our $dir = '/eniq/log/assureddc/radioNode';
+our $nodeListFile = "/tmp/radio_G1_G2_mixed_node_list.txt";
+
+sub main {
+    my $count = 0;
+    opendir(DIR, $dir) or die "couldn't open $dir: $!\n";
+    my @files = readdir DIR;
+    closedir DIR;
+    foreach my $file (@files) {
+        next if $file =~ /^\./;
+        if ( $file =~ /^node_name_(.*)_details_.*/ ) {
+            $count++;
+            my $technology = uc $1;
+            parseNodeCountLog($file, $technology, $count);
+        }
+    }
+}
+
+sub parseNodeCountLog {
+    my ($logFile, $technology, $count) = @_;
+    open FILE, "<$dir/$logFile" or die "Can't open file to read $logFile";
+    if ($technology eq "2G" || $technology eq "3G" || $technology eq "4G" || $technology eq "5G") {
+        while (my $line = <FILE>) {
+            next if ($line =~ /NULL|null|;;/);
+            if ($line =~ /^;(.*);(.*);/) {
+                if ($technology eq "2G") {
+                    my %r_hashOf2gElements = (
+                        nodeName   => $1,
+                        nodeType   => $2,
+                        technology => $technology,
+                        mode       => ""
+                    );
+                    push (@r_arrayOf2gHash, \%r_hashOf2gElements);
+                    push (@r_arrayOfAllHash, \%r_hashOf2gElements);
+                } elsif ($technology eq "3G") {
+                    my %r_hashOf3gElements = (
+                        nodeName   => $1,
+                        nodeType   => $2,
+                        technology => $technology,
+                        mode       => ""
+                    );
+                    push (@r_arrayOf3gHash, \%r_hashOf3gElements);
+                    push (@r_arrayOfAllHash, \%r_hashOf3gElements);
+                } elsif ($technology eq "4G") {
+                    my %r_hashOf4gElements = (
+                        nodeName   => $1,
+                        nodeType   => $2,
+                        technology => $technology,
+                        mode       => ""
+                    );
+                    push (@r_arrayOf4gHash, \%r_hashOf4gElements);
+                    push (@r_arrayOfAllHash, \%r_hashOf4gElements);
+                } elsif ($technology eq "5G") {
+                    my %r_hashOf5gElements = (
+                        nodeName   => $1,
+                        nodeType   => $2,
+                        technology => $technology,
+                        mode       => ""
+                    );
+                    push (@r_arrayOf5gHash, \%r_hashOf5gElements);
+                    push (@r_arrayOfAllHash, \%r_hashOf5gElements);
+                }
+            }
+        }
+    }
+    close FILE;
+
+    if ($count == 4) {
+        foreach my $hashOfAllElements (@r_arrayOfAllHash) {
+            if (($hashOfAllElements->{'nodeType'} eq "BSC") || ($hashOfAllElements->{'nodeType'} eq "RBS") || ($hashOfAllElements->{'nodeType'} eq "ERBS") || ($hashOfAllElements->{'nodeType'} eq "RNC") || ($hashOfAllElements->{'nodeType'} eq "MSRBS_V1")) {
+                my %r_hashOfSingleModeElements = (
+                    nodeName   => $hashOfAllElements->{'nodeName'},
+                    nodeType   => $hashOfAllElements->{'nodeType'},
+                    technology => $hashOfAllElements->{'technology'},
+                    mode       => "Single"
+                );
+                push (@r_arrayOfSingleModeHash, \%r_hashOfSingleModeElements);
+            } else {
+                if ($hashOfAllElements->{'nodeType'} eq "5GRadioNode") {
+                    $hashOfAllElements->{'nodeType'} = "RadioNode";
+                }
+                my %r_hashOfRadioNodeElements = (
+                    nodeName   => $hashOfAllElements->{'nodeName'},
+                    nodeType   => $hashOfAllElements->{'nodeType'},
+                    technology => $hashOfAllElements->{'technology'},
+                    mode       => ""
+                );
+                push (@r_arrayOfRadioNodeHash, \%r_hashOfRadioNodeElements);
+            }
+        }
+
+        if ($#r_arrayOf2gHash > -1) {
+            my $nodeType = "BSC";
+            my $technology = "2G";
+            calculateMixedRadioNodes($nodeType, $technology, @r_arrayOf2gHash);
+        }
+        if ($#r_arrayOf3gHash > -1) {
+            my $nodeType = "RBS";
+            my $technology = "3G";
+            calculateMixedRadioNodes($nodeType, $technology, @r_arrayOf3gHash);
+        }
+        if ($#r_arrayOf4gHash > -1) {
+            my $nodeType = "ERBS";
+            my $technology = "4G";
+            calculateMixedRadioNodes($nodeType, $technology, @r_arrayOf4gHash);
+        }
+        if ($#r_arrayOf5gHash > -1) {
+            my $nodeType = "";
+            my $technology = "5G";
+            calculateMixedRadioNodes($nodeType, $technology, @r_arrayOf5gHash);
+        }
+
+        my @arrayOFSingleRadioNode = ();
+        if ($#r_arrayOfRadioNodeHash > -1) {
+            foreach my $hashOfRadioNodeElements (@r_arrayOfRadioNodeHash) {
+                foreach my $hashOfMixedRadioNodeElements (@arrayOFMixedRadioNode) {
+                    if (defined $hashOfRadioNodeElements->{'nodeName'} && length $hashOfRadioNodeElements->{'nodeName'} ) {
+                        if ( ($hashOfRadioNodeElements->{'nodeName'} eq $hashOfMixedRadioNodeElements->{'nodeName'}) && ($hashOfRadioNodeElements->{'nodeType'} eq $hashOfMixedRadioNodeElements->{'nodeType'}) && ($hashOfRadioNodeElements->{'technology'} eq $hashOfMixedRadioNodeElements->{'technology'})) {
+                            delete $hashOfRadioNodeElements->{'nodeName'};
+                            delete $hashOfRadioNodeElements->{'nodeType'};
+                            delete $hashOfRadioNodeElements->{'technology'};
+                            delete $hashOfRadioNodeElements->{'mode'};
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($#r_arrayOfRadioNodeHash > -1) {
+            foreach my $hashOfRadioNodeElements (@r_arrayOfRadioNodeHash) {
+                if (defined $hashOfRadioNodeElements->{'nodeName'} && length $hashOfRadioNodeElements->{'nodeName'}) {
+                    $hashOfRadioNodeElements->{'mode'} = "Single Radio";
+                    push (@arrayOFSingleRadioNode, $hashOfRadioNodeElements);
+                }
+            }
+        }
+
+        open FILE, ">$nodeListFile" or die "Can't open file to read $nodeListFile";
+        my ($twoGCountForSingle, $threeGCountForSingle, $fourGCountForSingle, $fiveGCountForSingle, $threeGCountForRNC, $threeGCountForPico, $fourGCountForPico) = getNodeCount("G1", @r_arrayOfSingleModeHash);
+        my ($twoGCountForSingleRadio, $threeGCountForSingleRadio, $fourGCountForSingleRadio, $fiveGCountForSingleRadio) = getNodeCount("G2", @arrayOFSingleRadioNode);
+        my ($twoGCountForMixedRadio, $threeGCountForMixedRadio, $fourGCountForMixedRadio, $fiveGCountForMixedRadio) = getNodeCount("Mixed", @arrayOFMixedRadioNode);
+        close FILE;
+
+        my $totalCountForTwoG = $twoGCountForSingle + $twoGCountForSingleRadio + $twoGCountForMixedRadio;
+        my $totalCountForThreeG = $threeGCountForSingle + $threeGCountForSingleRadio + $threeGCountForMixedRadio;
+        my $totalCountForfourG = $fourGCountForSingle + $fourGCountForSingleRadio + $fourGCountForMixedRadio;
+        my $totalCountForFiveG = $fiveGCountForSingle + $fiveGCountForSingleRadio + $fiveGCountForMixedRadio;
+
+        my $nodeFile = "/tmp/radio_G1_G2_mixed_node_count.txt";
+        open FILE, ">$nodeFile" or die "Can't open file to read $nodeFile";
+        if ( defined $totalCountForTwoG ) {
+            printf FILE "%s:%d:%d:%d:%d\n", "GSM", $twoGCountForSingle, $twoGCountForSingleRadio, $twoGCountForMixedRadio, $totalCountForTwoG;
+        }
+        if ( defined $totalCountForThreeG ) {
+            printf FILE "%s:%d:%d:%d:%d\n", "WCDMA", $threeGCountForSingle, $threeGCountForSingleRadio, $threeGCountForMixedRadio, $totalCountForThreeG;
+        }
+        if ( defined $totalCountForfourG ) {
+            printf FILE "%s:%d:%d:%d:%d\n", "LTE", $fourGCountForSingle, $fourGCountForSingleRadio, $fourGCountForMixedRadio, $totalCountForfourG;
+        }
+        if ( defined $totalCountForFiveG ) {
+            printf FILE "%s:%d:%d:%d:%d\n", "5G NR", $fiveGCountForSingle, $fiveGCountForSingleRadio, $fiveGCountForMixedRadio, $totalCountForFiveG;
+        }
+        close FILE;
+
+        my $fourGCountForRNC = 0;
+        my $totalCountForThreeGPicoRnc = $threeGCountForRNC + $threeGCountForPico;
+        my $totalCountForFourGPicoRnc = $fourGCountForRNC + $fourGCountForPico;
+        my $nodeRncPicoFile = "/tmp/radio_pico_rnc_node_count.txt";
+        open FILE, ">$nodeRncPicoFile" or die "Can't open file to read $nodeRncPicoFile";
+        if ( defined $totalCountForThreeGPicoRnc ) {
+            printf FILE "%s:%d:%d:%d\n", "WCDMA", $threeGCountForPico, $threeGCountForRNC, $totalCountForThreeGPicoRnc;
+        }
+        if ( defined $totalCountForFourGPicoRnc ) {
+            printf FILE "%s:%d:%d:%d\n", "LTE", $fourGCountForPico, $fourGCountForRNC, $totalCountForFourGPicoRnc;
+        }
+        close FILE;
+    }
+}
+
+sub getNodeCount {
+    my ($mode, @r_arrayOfMode) = @_;
+    my $twoGCount = 0;
+    my $threeGCount = 0;
+    my $fourGCount = 0;
+    my $fiveGCount = 0;
+    my $threeGCountRNC = 0;
+    my $threeGCountPICO = 0;
+    my $fourGCountPICO = 0;
+
+    foreach my $hashOfModeElements (@r_arrayOfMode) {
+        if ($hashOfModeElements->{'technology'} eq "2G") {
+            $twoGCount++;
+            printf FILE "%s,%s,%s\n", "GSM", $hashOfModeElements->{'nodeName'}, $mode;
+        } elsif (($hashOfModeElements->{'technology'} eq "3G") && ($hashOfModeElements->{'nodeType'} eq "RBS" || $hashOfModeElements->{'nodeType'} eq "RadioNode")) {
+            $threeGCount++;
+            printf FILE "%s,%s,%s\n", "WCDMA", $hashOfModeElements->{'nodeName'}, $mode;
+        } elsif (($hashOfModeElements->{'technology'} eq "3G") && ($hashOfModeElements->{'nodeType'} eq "RNC")) {
+            $threeGCountRNC++;
+            printf FILE "%s,%s,%s\n", "WCDMA", $hashOfModeElements->{'nodeName'}, "RNC";
+        } elsif (($hashOfModeElements->{'technology'} eq "3G") && ($hashOfModeElements->{'nodeType'} eq "MSRBS_V1")) {
+            $threeGCountPICO++;
+            printf FILE "%s,%s,%s\n", "WCDMA", $hashOfModeElements->{'nodeName'}, "PICO";
+        } elsif (($hashOfModeElements->{'technology'} eq "4G") && ($hashOfModeElements->{'nodeType'} eq "ERBS" || $hashOfModeElements->{'nodeType'} eq "RadioNode")) {
+            $fourGCount++;
+            printf FILE "%s,%s,%s\n", "LTE", $hashOfModeElements->{'nodeName'}, $mode;
+        } elsif (($hashOfModeElements->{'technology'} eq "4G") && ($hashOfModeElements->{'nodeType'} eq "MSRBS_V1")) {
+            $fourGCountPICO++;
+            printf FILE "%s,%s,%s\n", "LTE", $hashOfModeElements->{'nodeName'}, "PICO";
+        } elsif ($hashOfModeElements->{'technology'} eq "5G") {
+            $fiveGCount++;
+            printf FILE "%s,%s,%s\n", "5G NR", $hashOfModeElements->{'nodeName'}, $mode;
+        }
+    }
+    if ($mode eq "G2" || $mode eq "Mixed") {
+        return ($twoGCount, $threeGCount, $fourGCount, $fiveGCount);
+    } else {
+        return ($twoGCount, $threeGCount, $fourGCount, $fiveGCount, $threeGCountRNC, $threeGCountPICO, $fourGCountPICO);
+    }
+}
+
+sub calculateMixedRadioNodes {
+    my ($nodeType, $technology, @r_individualTechArray) = @_;
+    foreach my $hashOfElements (@r_individualTechArray) {
+        my $counter = 0;
+        my $matchFound = 0;
+        if ($hashOfElements->{'nodeType'} ne $nodeType) {
+            if ($#arrayOFMixedRadioNode > -1) {
+                foreach my $hashOfMixedRadioNodeElement (@arrayOFMixedRadioNode) {
+                    if ( ($hashOfElements->{'nodeName'} eq $hashOfMixedRadioNodeElement->{'nodeName'}) && ($hashOfElements->{'nodeType'} eq $hashOfMixedRadioNodeElement->{'nodeType'})  && ($hashOfElements->{'technology'} eq $hashOfMixedRadioNodeElement->{'technology'}) ) {
+                        $matchFound = 1;
+                        last;
+                    }
+                }
+            }
+            if ($matchFound == 0) {
+                foreach my $hashOfRadioNodeElements (@r_arrayOfRadioNodeHash) {
+                    if (defined $hashOfRadioNodeElements->{'nodeName'} && $hashOfRadioNodeElements->{'nodeType'}) {
+                        if ( ($hashOfElements->{'nodeName'} eq $hashOfRadioNodeElements->{'nodeName'}) && ($hashOfElements->{'nodeType'} eq $hashOfRadioNodeElements->{'nodeType'}) && ($hashOfRadioNodeElements->{'technology'} ne $technology) ) {
+                            my %r_hashOfMixedRadioNode = (
+                                nodeName   => $hashOfRadioNodeElements->{'nodeName'},
+                                nodeType   => $hashOfRadioNodeElements->{'nodeType'},
+                                technology => $hashOfRadioNodeElements->{'technology'},
+                                mode       => "Mixed Radio"
+                            );
+                            push (@arrayOFMixedRadioNode, \%r_hashOfMixedRadioNode);
+                            $counter = 1;
+                        }
+                    }
+                }
+                if ($counter == 1) {
+                    $hashOfElements->{'mode'} = "Mixed Radio";
+                    push (@arrayOFMixedRadioNode, $hashOfElements);
+                }
+            }
+        }
+    }
+}
+
+main();

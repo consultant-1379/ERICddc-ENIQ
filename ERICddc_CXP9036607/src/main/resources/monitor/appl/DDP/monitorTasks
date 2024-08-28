@@ -1,0 +1,58 @@
+#!/bin/bash
+
+MONITORDIR=$(dirname $0)
+MONITORDIR=$(cd ${MONITORDIR} 2>/dev/null && pwd || echo ${MONITORDIR})
+DDCDIR=$(cd ${MONITORDIR}/../../../ 2>/dev/null && pwd || echo ${MONITORDIR}/../../../)
+
+[ -f ${DDCDIR}/etc/global.env ] && source ${DDCDIR}/etc/global.env
+DDP_SCRIPT="/data/ddp/current/monitor/monitorTasks"
+
+if [ -z "$1" ]; then
+    logErrorAndDie "Usage: $0 [START | STOP | TRIGGER | MAKETAR | INSTALL | UNINSTALL]"
+fi
+
+TASK=$1
+
+doInit() {
+    logDebug "Initiating"
+    delegate INIT
+}
+
+doStart() {
+    logDebug "Starting"
+    delegate START
+}
+
+doStop() {
+    logDebug "Stopping"
+    delegate STOP
+}
+
+doTrigger() {
+    logDebug "Triggering"
+    delegate TRIGGER
+}
+
+doMakeTar() {
+    logDebug "Making tar"
+    delegate MAKETAR
+}
+
+doStopAndMaketar() {
+    logDebug "Called stopAndMakeTar"
+}
+
+delegate() {
+    if [ -x "${DDP_SCRIPT}" ] ; then
+        ${DDP_SCRIPT} $*
+    fi
+}
+
+case $TASK in
+    "INIT") doInit ;;
+    "START") doStart ;;
+    "STOP") doStop ;;
+    "TRIGGER") doTrigger ;;
+    "MAKETAR") doMakeTar ;;
+    "DEFAULT") doError ;;
+esac

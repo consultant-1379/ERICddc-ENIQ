@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>Brian Goggin</createdBy>
+    <profile name="PCI-Profile">
+        <description>A profiler for PCI Services.</description>
+        <pollInterval>60</pollInterval>
+        <outputHandler type="simple" file="OSS/pci_instr.txt" />
+        <provider type="jmx" name="PCI">
+            <searchString>.*-Ds=PCIServer.*</searchString>
+            <metricGroup name="MethodCount">
+                <mbeanName>pci:name=MethodCount</mbeanName>
+                <mapMetric name="AllMethodsCount" />
+            </metricGroup>
+        </provider>
+    </profile>
+</instr>

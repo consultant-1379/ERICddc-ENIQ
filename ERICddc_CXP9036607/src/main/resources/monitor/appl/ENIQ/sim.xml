@@ -1,0 +1,50 @@
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+  <createdBy>DDC</createdBy>
+  <profile name="SIM-jmx">
+    <description>A profiler for SIM to collect generic JVM information</description>
+    <provider type="jmx" name="SIM">
+      <searchString>.*-Ds=ESM.*</searchString>
+      <metricGroup name="jvm-memory">
+        <mbeanName>java.lang:type=Memory</mbeanName>
+        <metric name="ObjectPendingFinalizationCount" />
+        <compositeMetric name="HeapMemoryUsage">
+          <metric name="committed" />
+          <metric name="init" />
+          <metric name="max" />
+          <metric name="used" />
+        </compositeMetric>
+        <compositeMetric name="NonHeapMemoryUsage">
+          <metric name="committed" />
+          <metric name="init" />
+          <metric name="max" />
+          <metric name="used" />
+        </compositeMetric>
+      </metricGroup>
+      <metricGroup name="threads">
+        <mbeanName>java.lang:type=Threading</mbeanName>
+        <metric name="ThreadCount" />
+        <metric name="PeakThreadCount" />
+      </metricGroup>
+      <metricGroup name="os">
+        <mbeanName>java.lang:type=OperatingSystem</mbeanName>
+        <metric name="ProcessCpuTime" />
+        <metric name="AvailableProcessors" />
+        <metric name="ProcessCpuLoad" />
+        <metric name="OpenFileDescriptorCount" />
+      </metricGroup>
+      <metricGroup name="runtime">
+        <mbeanName>java.lang:type=Runtime</mbeanName>
+        <metric name="Uptime" />
+      </metricGroup>
+    </provider>
+    <provider type="jvmgc" name="SIM">
+      <searchString>.*-Ds=ESM.*</searchString>
+      <metric name="young-count" />
+      <metric name="young-time" />
+      <metric name="old-count" />
+      <metric name="old-time" />
+    </provider>
+  </profile>
+</instr>

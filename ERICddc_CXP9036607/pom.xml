@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.ericsson.eniq</groupId>
+    <artifactId>ERICddc-ENIQ</artifactId>
+    <version>4.3.7-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>ERICddc_CXP9036607</artifactId>
+  <description>Diagnostic Data Collection(DDC) for ENIQ</description>
+  <packaging>${rpm.packaging}</packaging>
+
+  <properties>
+    <rpm-root>opt</rpm-root>
+    <comp-name>ericsson</comp-name>
+    <install-path>ERICddc</install-path>
+  </properties>
+
+  <build>
+    <plugins>
+      <plugin>
+        <artifactId>maven-resources-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>resources</id>
+            <phase>generate-resources</phase>
+            <goals>
+              <goal>resources</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>rpm-maven-plugin</artifactId>
+        <configuration>
+          <requires>
+            <require>expect</require>
+            <require>ERICddccore_CXP9035927</require>
+          </requires>
+          <description>
+            Diagnostic Data Collection Scripts and Utilities for ENIQ
+          </description>
+          <summary>
+            ERICddc_CXP9036607
+          </summary>
+          <mappings combine.self="override">
+            <mapping>
+              <directory>/${rpm-root}/${comp-name}/${install-path}</directory>
+              <filemode>775</filemode>
+              <username>root</username>
+              <groupname>root</groupname>
+              <configuration>false</configuration>
+              <directoryIncluded>true</directoryIncluded>
+              <recurseDirectories>true</recurseDirectories>
+              <sources>
+                <source>
+                  <location>src/main/resources/</location>
+                  <excludes>
+                    <exclude>**/*.pyc</exclude>
+                    <exclude>**/version.txt</exclude>
+                    <exclude>**/*.gitignore</exclude>
+                    <exclude>**/ETF.xml</exclude>
+                    <exclude>**/*.sql</exclude>
+                  </excludes>
+                </source>
+              </sources>
+            </mapping>
+            <mapping>
+              <directory>/${rpm-root}/${comp-name}/${install-path}/lib</directory>
+              <filemode>775</filemode>
+              <username>root</username>
+              <groupname>root</groupname>
+              <configuration>false</configuration>
+              <directoryIncluded>true</directoryIncluded>
+              <recurseDirectories>true</recurseDirectories>
+              <dependency />
+            </mapping>
+          </mappings>
+          <preinstallScriptlet>
+            <scriptFile>src/main/scripts/preinstall.sh</scriptFile>
+          </preinstallScriptlet>
+          <posttransScriptlet>
+            <scriptFile>src/main/scripts/posttrans.sh</scriptFile>
+          </posttransScriptlet>
+        </configuration>
+      </plugin>
+    </plugins>
+
+  </build>
+</project>

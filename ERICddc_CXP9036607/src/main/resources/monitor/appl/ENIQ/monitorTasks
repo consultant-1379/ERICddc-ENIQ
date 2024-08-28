@@ -1,0 +1,319 @@
+#!/bin/bash
+
+ENIQ_MONITORDIR=$(dirname $0)
+ENIQ_MONITORDIR=$(cd ${ENIQ_MONITORDIR} 2>/dev/null && pwd || echo ${ENIQ_MONITORDIR})
+
+DDCDIR=$(cd ${ENIQ_MONITORDIR}/../../../ 2>/dev/null && pwd || echo ${ENIQ_MONITORDIR}/../../../)
+
+[ -f ${DDCDIR}/etc/global.env ] && . ${DDCDIR}/etc/global.env
+[ -f ${ENIQ_MONITORDIR}/functions ] && . ${ENIQ_MONITORDIR}/functions
+
+OUTPUT_DIR="${DATAROOT}/${DATE}/ENIQ"
+PLUGIN_DATA_DIR="${DATAROOT}/${DATE}/plugin_data"
+SERVER_DIR="${DATAROOT}/${DATE}/server"
+ILO_DIR="${DATAROOT}/${DATE}/ilo"
+
+if [ -z "$1" ]; then
+    die "Usage: $0 [START | STOP | TRIGGER | MAKETAR | INSTALL | UNINSTALL]"
+fi
+
+TASK=$1
+
+prechecks() {
+    if [ ! -d "${OUTPUT_DIR}" ] ; then
+        $_MKDIR -p ${OUTPUT_DIR}
+        [ $? -ne 0 ] && die "could not create ENIQ data directory: ${OUTPUT_DIR}"
+    fi
+
+    if [ ! -d ${PLUGIN_DATA_DIR} ] ; then
+        mkdir -p ${PLUGIN_DATA_DIR}
+        [ $? -ne 0 ] && die "could not create plugin_data directory: ${PLUGIN_DATA_DIR}"
+        chmod 777 ${PLUGIN_DATA_DIR}
+    fi
+
+    if [ ! -d ${SERVER_DIR} ] ; then
+        mkdir -p ${SERVER_DIR}
+        [ $? -ne 0 ] && die "could not create server directory: ${SERVER_DIR}"
+        chmod 777 ${SERVER_DIR}
+    fi
+
+    if [ ! -d ${ILO_DIR} ] ; then
+        mkdir -p ${ILO_DIR}
+        [ $? -ne 0 ] && die "could not create ilo directory: ${ILO_DIR}"
+        chmod 777 ${ILO_DIR}
+    fi
+}
+
+doInit() {
+    progress "$0: initing"
+    verifyNasAvailable
+    prechecks
+}
+
+doStart() {
+    progress "$0: starting"
+    prechecks
+
+    jvm_monitor
+    if [ "${ENIQ_SERVER_TYPE}" = "eniq_events" ] || [ "${ENIQ_SERVER_TYPE}" = "eniq_mz" ] || [ "${ENIQ_SERVER_TYPE}" = "eniq_stats_linux" ] ; then
+        monitorMZ
+    fi
+
+    if [ ${SYB_COLLECTOR} -eq 1 ] ; then
+        iqmonitor
+    fi
+
+    if [ "${ENIQ_SERVER_TYPE}" = "stats_engine" ] || [ "${ENIQ_SERVER_TYPE}" = "eniq_stats" ] ; then
+        /opt/ericsson/ERICddc/monitor/appl/ENIQ/ossIntegrationDataCollection
+    fi
+
+    /opt/ericsson/ERICddc/monitor/appl/ENIQ/eniqHistoryActivityDataCollection
+
+    if [ ${ENIQ_MASTER} -eq 1 ] ; then
+        $_TOUCH ${DATAROOT}/${DATE}/DDC_MASTER
+        if [ -r ${SITEDATAROOT}/config/MONITOR_UNITY ]; then
+            $_TOUCH ${SITEDATAROOT}/config/UNITY_PERF
+            collectSAN
+            collectUnityCertificateDetails
+        fi
+        removeOldEricDDDCEniqLogs
+
+        collectNodeDetails
+        /opt/ericsson/ERICddc/monitor/appl/ENIQ/radioNodeCountCollection
+        collectCellDetails
+        /opt/ericsson/ERICddc/monitor/appl/ENIQ/radioCellCountCollection
+        collect_radio_node_cell_count_logfile
+
+        collectTransportIMSCoreNodeLog
+        /opt/ericsson/ERICddc/monitor/appl/ENIQ/installedFeaturesDataCollection
+        collectInstalledFeaturesLogs
+        collectIloConfigFile
+        collectEniqHistoryActivityLog
+
+        # To copy general-jmx xml
+        collectJmxXml
+        startInstr
+        collectOSSIntegrationLog
+    fi
+
+    startRLA
+}
+
+startInstr() {
+    # maxtime 90000 - 25 hours
+    logDebug "Starting instr process"
+    # To start the instr process if any configuration files exist
+    SIM_SERVICE_FLAG=`ps -eaf | grep -w ESM | grep -v grep | wc -l`
+    if [ ${SIM_SERVICE_FLAG} -eq 1 ] ; then
+        if [ -d "${DATAROOT}/${DATE}/instr" ] ; then
+            [ -f ${DATAROOT}/${DATE}/instr.exit ] && $_RM -f ${DATAROOT}/${DATE}/instr.exit
+            export JAVAFLAGS="${JAVAFLAGS} -Dcom.sun.management.jmxremote"
+            export JAVA_HOME=/eniq/sw/runtime/jdk
+            ${UTILDIR}/bin/instr -basedir ${DATAROOT}/${DATE} -metrics ${DATAROOT}/${DATE}/instr -defaultLogFile ${DATAROOT}/${DATE}/instr.txt >> ${DATAROOT}/${DATE}/instr.log -maxtime 90000 2>&1 &
+        fi
+    fi
+}
+
+stopInstr() {
+    logDebug "Stopping instr process"
+    $_TOUCH ${DATAROOT}/${DATE}/instr.exit
+
+    INSTR_CHECK_TIMEOUT="30"
+    while [ "${INSTR_CHECK_TIMEOUT}" -gt 0 ] ; do
+        INSTR_PS=$(${UTILDIR}/bin/jps --wide | $_GREP "Ds=instr" | $_GREP -v $_GREP)
+        if [ -z "${INSTR_PS}" ] ; then
+            break
+        fi
+        ((INSTR_CHECK_TIMEOUT--))
+        $_SLEEP 1
+    done
+
+    if [ "${INSTR_CHECK_TIMEOUT}" -eq 0 ] ; then
+        logWarning "Killing instr process on timeout"
+        ${UTILDIR}/bin/jps --wide | $_GREP "Ds=instr" | $_GREP -v $_GREP | $_AWK '{print $1}' | $_XARGS $_KILL -9 > /dev/null 2>&1
+        if [ -f ${DATAROOT}/${DATE}/instr.exit ] ; then
+            $_RM -f ${DATAROOT}/${DATE}/instr.exit
+        fi
+    fi
+}
+
+restartInstr() {
+    logDebug "Restarting instr process"
+    stopInstr
+    startInstr
+}
+
+doStop() {
+    progress "$0: stopping"
+    stopIqmonitor
+    stopDaemons
+    IQMONLOGS=$(getIqMonLogNames)
+    #HO96637 - Errors thrown from monitorTasks script on ENIQ Events [CH: 20111117]
+    [ ! -z "${IQMONLOGS}" ] && $_RM ${IQMONLOGS}
+    # WP00289 - clean up IQ Monitor Logs generated by DDC [04-05-12 RK]
+    cleanupIqMonDdcLogs
+    restartInstr
+}
+
+doShutdown() {
+    progress "$0: shutting down"
+    stopIqmonitor
+    stopDaemons
+
+    if [ ${ENIQ_MASTER} -eq 1 ] ; then
+        $_TOUCH ${DATAROOT}/${DATE}/instr.exit
+    fi
+}
+
+doTrigger() {
+    progress "$0: triggering"
+    if [ ${SYB_COLLECTOR} -eq 1 ] ; then
+        prechecks
+        iqconnection
+        # start the monitor if it is not already running
+        if [ -z "$(getIqmonPID)" ] ; then
+            iqmonitor
+        fi
+    fi
+
+    /opt/ericsson/ERICddc/monitor/appl/ENIQ/nodeHardeningDataCollection
+
+    /opt/ericsson/ERICddc/monitor/appl/ENIQ/lunMpathMappingDataCollection
+
+    if [ "${ENIQ_SERVER_TYPE}" = "eniq_stats" ] || [ "${ENIQ_SERVER_TYPE}" = "eniq_stats_linux" ] || [ "${ENIQ_SERVER_TYPE}" = "stats_coordinator" ] ; then
+        TRIGGER_SPECIFIC_TIMESTAMP=$(/usr/bin/date "+%H:%M")
+        if [ ${TRIGGER_SPECIFIC_TIMESTAMP} = "23:50" ]; then
+            collectBISLogs
+            collectNetanServerLogs
+            collectOCSWithoutCitrixLogs
+        fi
+        loaderAggregator
+        collectHeapMemoryAndEngineCertificateLogs
+        techpackDetailsCollection
+        collectSimLogs
+        collectBacklogMonitoringLogs
+        collectSapIqLargeMemoryLogs
+        upgradeTimeCalculation
+        collectSybaseIqVersionLog
+        collectFLSLog
+        collectRhelOSAndPatchVersionLogs
+        collectAccessedAndAggregationFailureCounterLogs
+        collectDDPReport
+        collectFCSwitchPortDetails
+        collectIQDiagnosticLog
+        collectOmPatchMedia
+        collectNodeHardeningLog
+        collectDBCCLogs
+        collectLunMpathIQMappingLogs
+    fi
+    coredumpDetailsCollection
+    collectOMBSBackupLog
+    collectRollingSnapshotLog
+    sybaseiqInstrMetricCollector
+    /opt/ericsson/ERICddc/monitor/appl/ENIQ/eniqServiceRestart
+    collectServiceRestartLog
+    osMemoryProfileCollection
+    collectOsMessages
+    collectMpathIQHeaderFlagLogs
+}
+
+doMakeTar() {
+    progress "$0: making tar"
+    prechecks
+    # If we are on the master, trigger a MAKETAR on the rest of the servers
+    [ ${ENIQ_MASTER} -ne 1 ] && return
+    # DATAROOT is based on hostnames, hopeully
+    [ "$($_BASENAME ${DATAROOT})" != "${THISHOST}" ] && return
+    ENIQ_HOSTS=$($_LS ${BASE_DATAROOT})
+    for ENIQ_HOST in ${ENIQ_HOSTS} ; do
+        # Make sure that this really a host directory
+        if [ -d ${BASE_DATAROOT}/${ENIQ_HOST}/${DATE} ] ; then
+            progress "Triggering ${ENIQ_HOST} to make tar"
+            if [ -d "${BASE_DATAROOT}/${ENIQ_HOST}" ] && [ "${ENIQ_HOST}" != "${THISHOST}" ] ; then
+                # TODO: possibly loop a few times here to allow an existing command to
+                # be picked up?
+                if [ ! -f "${BASE_DATAROOT}/${ENIQ_HOST}/.ddcCommand" ] ; then
+                    $_ECHO "MAKETAR" > ${BASE_DATAROOT}/${ENIQ_HOST}/.ddcCommand
+                else
+                    warn "could not trigger maketar on ${ENIQ_HOST}"
+                fi
+            fi
+        fi
+    done
+}
+
+doStopAndMaketar() {
+    progress "$0: stopAndMakeTar"
+
+    if [ "${TASK}" == "STOP" ] ; then
+        # STOP is called @ 23:59 so we want to wait here for 1 min
+        # to make sure we've reached the end of the day
+        # This is important for logs that we filter with "todays" date
+        sleep 60
+    fi
+    prechecks
+    EXCLUDE_FILES=""
+
+    # exit if either of these fail - it will be either a filesystem fault or we're not on an ENIQ server,
+    # either of which make the rest of the script pointless
+    $_CP /eniq/admin/version/eniq_status ${OUTPUT_DIR} || die "could not copy eniq_status"
+    $_CP /eniq/admin/version/eniq_history ${OUTPUT_DIR} || die "could not copy eniq_history"
+    $_ECHO "${ENIQ_SERVER_TYPE}" > ${OUTPUT_DIR}/eniq_server_type
+    $_ECHO "${READER_SERVER_TYPE}" > ${OUTPUT_DIR}/eniq_reader_type
+
+    # Store timezone info
+    $_ECHO "${TZ}::${LOCALHOUR}::${UTCHOUR}" > ${OUTPUT_DIR}/tz.txt
+
+    # Collect IQ stats from any node that has IQ
+    if [ ${SYB_COLLECTOR} -eq 1 ] ; then
+        iqdbspace
+        iqfile
+        listRawDevices ${DATAROOT}/${DATE}/server
+        collectIqMonLogs
+    fi
+
+    # Only collect data from the ENIQ tables on one node
+    if [ ${ENIQ_MASTER} -eq 1 ] ; then
+        duration
+
+        if [ "${ENIQ_SERVER_TYPE}" = "eniq_stats" ] || [ "${ENIQ_SERVER_TYPE}" = "stats_coordinator" ] || [ "${ENIQ_SERVER_TYPE}" = "eniq_stats_linux" ] ; then
+            collectStatsLogs
+            rpm -qi  ERICddc_CXP9036607 > ${SERVER_DIR}/ERICddc-ENIQ.rpminfo 2>&1
+        elif [ "${ENIQ_SERVER_TYPE}" = "eniq_events" ] || [ "${ENIQ_SERVER_TYPE}" = "eniq_coordinator" ] ; then
+            collectEventsCounts
+            collectServerAccessLogs
+            collectStreamingInstr
+            collectMzLogs
+            collectEngineLogs
+        fi
+
+        adapterLog PREPROCESSING
+        adapterLog PROCESSING
+
+        # ENIQ 12 - WP00155: Collect data for events duration [2012-02-02 eronkeo]
+        eventLog
+
+        collectPeerArchives
+    fi
+
+    if [ "${ENIQ_SERVER_TYPE}" = "eniq_cep" ] ; then
+        parseCedMedLog
+    fi
+
+    # Create excludes file
+    makeExcludesFile ENIQ "${EXCLUDE_FILES}"
+
+}
+
+case $TASK in
+    "INIT") doInit ;;
+    "START") doStart ;;
+    "STOP") doStopAndMaketar ; doStop ;;
+    "TRIGGER") doTrigger ;;
+    "MAKETAR") doMakeTar ; doStopAndMaketar ;;
+    "SHUTDOWN") doShutdown ;;
+    "DEFAULT") doError ;;
+esac
+
+
+

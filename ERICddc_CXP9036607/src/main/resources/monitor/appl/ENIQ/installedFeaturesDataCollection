@@ -1,0 +1,63 @@
+#!/usr/bin/perl
+##############################################################################
+#  Description --------- installedFeaturesDataCollection --------------------
+#  This script parses installed Features logs and stores data to JSON format
+##############################################################################
+
+use strict;
+use warnings;
+use JSON;
+
+sub main {
+    my $outputDir = "/eniq/log/assureddc/installed_features";
+    if ( !(-d $outputDir) ) {
+        mkdir $outputDir;
+    }
+    my $installedFeatureInstallerFile = "/eniq/sw/installer/installed_features";
+    my $installedFeatureConfFile = "/eniq/sw/conf/install_features";
+    my @featuresInformationArrayData = ();
+    my %buildNameCxcNumberIdMap;
+    my @consolidatedArrayData = ();
+
+    if ( -e $installedFeatureInstallerFile and -e $installedFeatureConfFile ) {
+        open FILE, "<$installedFeatureInstallerFile" or die "Can't open file to read $installedFeatureInstallerFile\n";
+        while ( my $line = <FILE> ) {
+            if ( $line =~ /^(CXC\d+)::.*::(CXP\d+)::(.*)/ ) {
+                my %versionData = (
+                    CXCNumber => $1,
+                    CXPNumber => $2,
+                    buildNumber => $3
+                );
+                push(@featuresInformationArrayData, \%versionData);
+            }
+        }
+        close FILE;
+        open FILE, "<$installedFeatureConfFile" or die "Can't open file to read $installedFeatureConfFile\n";
+        while ( my $line = <FILE> ) {
+            if ( $line =~ /^(CXC.*)::(.*)::.*/ ) {
+                $buildNameCxcNumberIdMap{$1} = $2;
+            }
+        }
+        close FILE;
+        foreach my $data_element ( @featuresInformationArrayData ) {
+            if ( defined $buildNameCxcNumberIdMap{$data_element->{'CXCNumber'}} ) {
+                my %consolidatedDataHash = (
+                    CXCNumber => $data_element->{'CXCNumber'},
+                    featuresName => $buildNameCxcNumberIdMap{$data_element->{'CXCNumber'}},
+                    CXPNumber => $data_element->{'CXPNumber'},
+                    buildNumber => $data_element->{'buildNumber'}
+                    );
+                push(@consolidatedArrayData, \%consolidatedDataHash);
+            }
+        }
+
+        if ( $#consolidatedArrayData > -1 ) {
+            my $json_data = encode_json \@consolidatedArrayData;
+            open(JSON, ">$outputDir/installed_feature.json") or die "cannot open file for reading: $!";
+            print JSON $json_data."\n";
+            close JSON;
+        }
+    }
+}
+
+main();

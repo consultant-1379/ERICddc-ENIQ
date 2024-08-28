@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>Ronan Keogh</createdBy>
+    <profile name="PMServ_si_0_jee_instance-jmx">
+        <description>A profiler for PMServ_si_0_jee_instance which monitors thread and memory</description>
+        <provider type="jmx" name="PMServ_si_0_jee_instance">
+            <ipService host="<JBOSS_INSTANCE_IP_ADDRESS>" port="<JBOSS_INSTANCE_PORT_NUM>" creds="<JBOSS_INSTANCE_USERID>:<JBOSS_INSTANCE_PASSWD>" />
+            <metricGroup name="collectFiles">
+             <mbeanName><![CDATA[com.ericsson.oss.services.pm.service.ejb.FileCollectionServiceImpl.pmservice:type=collectFiles(class [Lcom.ericsson.oss.services.pm.service.api.FileCollectionDetails;_)]]></mbeanName>
+                <metric name="methodFailures" />
+                <metric name="executionTimeMillis" />
+                <metric name="methodInvocations" />
+            </metricGroup>
+            <metricGroup name="processFileCollectionResults">
+             <mbeanName><![CDATA[com.ericsson.oss.services.pm.service.ejb.FileCollectionResultHandler.pmservice:type=processFileCollectionResults(com.ericsson.oss.itpf.sdk.eventbus.model.ModeledEvent<com.ericsson.oss.mediation.pm.model.FileCollectionSuccess>_)]]></mbeanName>
+                <metric name="methodFailures" />
+                <metric name="executionTimeMillis" />
+                <metric name="methodInvocations" />
+            </metricGroup>
+            <metricGroup name="processFileCollectionFailure">
+             <mbeanName><![CDATA[com.ericsson.oss.services.pm.service.ejb.FileCollectionResultHandler.pmservice:type=processFileCollectionFailure(com.ericsson.oss.itpf.sdk.eventbus.model.ModeledEvent<com.ericsson.oss.mediation.pm.model.FileCollectionFailure>_)]]></mbeanName>
+                <metric name="methodFailures" />
+                <metric name="executionTimeMillis" />
+                <metric name="methodInvocations" />
+            </metricGroup>
+        </provider>
+    </profile>
+</instr>

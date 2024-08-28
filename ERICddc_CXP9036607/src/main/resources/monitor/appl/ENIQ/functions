@@ -1,0 +1,3249 @@
+#!/bin/bash
+# NOT TO BE RUN INDEPENDENTLY
+
+verifyNasAvailable() {
+    # Wait for NAS to come online
+    log "Checking for SFS"
+    local wait=0
+    DDC_DATA_MOUNTED=0
+
+    while [ ${DDC_DATA_MOUNTED} -eq 0 ] ; do
+    # Check to see if we've mounted it yet
+        $_GREP -w "/eniq/log"  /etc/mtab > /dev/null
+        if [ $? -eq 0 ] ; then
+            DDC_DATA_MOUNTED=1
+        fi
+
+       if [ $DDC_DATA_MOUNTED -eq 0 ] ; then
+            $_SLEEP 30
+            let wait=${wait}+30
+        fi
+    done
+
+    log "SFS is ready"
+    source ${DDCDIR}/etc/global.env
+
+    # If ddc_data directory in /var/tmp exists, remove it
+    if [ -d "/var/tmp/ddc_data" ] ; then
+        $_RM -rf /var/tmp/ddc_data
+    fi
+}
+
+getIqPassword() {
+    USER=$1
+
+    export CONF_DIR="/eniq/sw/conf"
+    PW=""
+    if [ -f ${CONF_DIR}/dwh.ini ] ; then
+        PWD_FIELD=`egrep "^{USER}Password=" ${CONF_DIR}/dwh.ini | $_HEAD -1`
+        KEY_DB=`cut -d "=" -f 1 <<< "${PWD_FIELD}"`
+        VALUE_DBPassword=`cut -d "=" -f 2- <<< "${PWD_FIELD}"`
+        ENCRYPTION_FLAG=`egrep "^${USER}Password_Encrypted" ${CONF_DIR}/dwh.ini | awk -F= '{print $2}' | $_HEAD -1`
+    else
+        PWD_FIELD=`egrep "^${USER}Password=" ${CONF_DIR}/niq.ini | $_HEAD -1`
+        KEY_DB=`cut -d "=" -f 1 <<< "${PWD_FIELD}"`
+        VALUE_DBPassword=`cut -d "=" -f 2- <<< "${PWD_FIELD}"`
+        ENCRYPTION_FLAG=`egrep "^${USER}Password_Encrypted" ${CONF_DIR}/niq.ini | awk -F= '{print $2}' | $_HEAD -1`
+    fi
+
+    if [ "${ENCRYPTION_FLAG}" == Y ] ; then
+        PW=`${ECHO} ${VALUE_DBPassword} | /usr/bin/openssl enc -base64 -d`
+    elif [ "${ENCRYPTION_FLAG}" == YY ] ; then
+        PASSPHRASE=`cat /eniq/sw/conf/strong_passphrase`
+        PW=`${ECHO} ${VALUE_DBPassword} | openssl enc -aes-256-ctr -md sha512 -a -d -salt -pass pass:${PASSPHRASE}`
+    else
+        PW=$VALUE_DBPassword
+    fi
+
+    if [ -z "${PW}" ] && [ -r /eniq/sw/installer/dbusers ] ; then
+        PW=`/eniq/sw/installer/dbusers $USER dwh`
+    fi
+
+    if [ $? -ne 0 ] ; then
+        PW=""
+    fi
+    echo "${PW}"
+}
+
+getIqSrvInfo() {
+    # define the variable which specifies the database name in use on this host
+    IQDBNAME=""
+    # try to match iqsrv11 and iqsrv15 ..
+    IQPID=$($_PGREP '^iqsrv[0-9]+$')
+    [ -z "${IQPID}" ] && return
+
+    # retrieve the command line arguments
+    #PS_DATA=$($_UCB_PS -uxww ${IQPID} | $_TAIL -1)
+    PS_DATA=$(/usr/bin/ps -uxww ${IQPID} | grep -i 'iqsrv' | sort | $_HEAD -1)
+    # database name is specified on the command line, using "-n" flag to iqsrv
+    IQDBNAME=$($_ECHO ${PS_DATA} | $_PERL -e 'while (<STDIN>) { if (/.* -n (\S+).*/) { print $1 ; } }')
+    # tcp port is specified using "-x tcpip{port=1234}" flag to iqsrv
+    IQPORT=$($_ECHO ${PS_DATA} | $_PERL -e 'while (<STDIN>) { if (/.*port=([0-9]+).*/) { print $1 ; } }')
+    # DB file is called "dwhdb.db", we need to know the directory it is stored in (command line argument)
+    IQ_DB_DIR=$($_ECHO ${PS_DATA} | $_PERL -e 'while (<STDIN>) { if (/\s+(\S+)\/dwhdb.db/) { print $1 ; } }')
+}
+
+#
+# Source the Sybase env if we haven't already
+#
+initSybase() {
+    if [ -z "${DC_PW}" ] ; then
+        # Detect the version of Sybase IQ we are on [ BG 2010-06-01 ]
+        SYBASE_IQ_VERSION=`$_GREP "VERSION" /eniq/sybase_iq/version/iq_version | $_SED -e 's/\:\:/\@/g' | $_AWK -F\@ '{print $2}'`
+        # define the database name and listening port number
+        getIqSrvInfo
+
+    SYBASE_IQ_MAJOR_VERSION=`$_ECHO "${SYBASE_IQ_VERSION}" | $_AWK -F\. '{print $1}'`
+    SYBASE_IQ_MINOR_VERSION=`$_ECHO "${SYBASE_IQ_VERSION}" | $_AWK -F\. '{print $2}'`
+
+        if [[ ${SYBASE_IQ_MAJOR_VERSION} -ge 15 ]] ; then
+            DIR_FILE="IQ-${SYBASE_IQ_MAJOR_VERSION}_${SYBASE_IQ_MINOR_VERSION}"
+            IQ_FILE="/eniq/sybase_iq/${DIR_FILE}/${DIR_FILE}.sh"
+
+            if [ -r "${IQ_FILE}" ] ; then
+                . ${IQ_FILE}
+            else
+                die "Could not find Sybase env file"
+            fi
+
+            DC_PW=`getIqPassword DC`
+            DBA_PW=`getIqPassword DBA`
+
+            # Set the path to isql
+            PATH=${IQDIR16}/lib64/ocs:${PATH}
+
+            # Use the normal dbisql command in this IQ version
+            _DBISQL=${IQDIR16}/bin64/dbisql
+            # _DBISQL=/eniq/sybase_iq/IQ-16_1/bin64/dbisql
+        else
+            . /eniq/sybase_iq/SYBASE.sh
+
+            DC_PW=`egrep '^DCPassword=' /eniq/sw/conf/niq.ini | awk -F= '{print $2}'`
+            DBA_PW=`egrep '^DBAPassword=' /eniq/sw/conf/niq.ini | awk -F= '{print $2}'`
+
+            # Set the path to dbisql (TR HL86540 2010-05-21)
+            PATH=${SYBROOT}/ASIQ-12_7/bin:${PATH}
+
+            # use the shell wrapper for dbisql to prevent language errors in this IQ version
+            _DBISQL=${SYBROOT}/ASIQ-12_7/bin/dbisql.sh
+        fi
+
+        # Check password returned for DC and DBA if blank set IQDBNAME blank (TR HO69626 2011-09-07)
+        if [ -z "${DC_PW}" ] || [ -z "${DBA_PW}" ] ; then
+            IQDBNAME=""
+        fi
+    fi
+}
+
+duration() {
+    initSybase
+    log "collecting duration data"
+    # isql is put in the path by SYBASE.sh
+    isql -s\; -w999 -b -Udba -P${DBA_PW} -Srepdb repdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g' > ${OUTPUT_DIR}/duration.log
+set nocount on
+go
+SELECT
+etlrep.META_TRANSFER_BATCHES.META_COLLECTION_NAME,
+DATEFORMAT(etlrep.META_TRANSFER_BATCHES.START_DATE, "yyyy-mm-dd hh:nn:ss"),
+SECONDS(etlrep.META_TRANSFER_BATCHES.END_DATE) - SECONDS(etlrep.META_TRANSFER_BATCHES.START_DATE), STATUS, SETTYPE, DATEFORMAT(etlrep.META_TRANSFER_BATCHES.END_DATE, "yyyy-mm-dd hh:nn:ss")
+FROM
+etlrep.META_TRANSFER_BATCHES
+WHERE
+(
+    etlrep.META_TRANSFER_BATCHES.START_DATE  >  '${SQL_DATE}' AND
+    etlrep.META_TRANSFER_BATCHES.END_DATE IS NOT NULL
+)
+go
+EOF
+}
+
+adapterLog() {
+    TYPE=$1
+
+    log "collecting adapter data for ${TYPE}"
+    cat > ${OUTPUT_DIR}/adapter.${TYPE}.sql <<EOF
+SELECT DATEFORMAT(sessionstarttime, 'YY-mm-dd:hh') + ':00' AS hour,sum(NUM_OF_ROWS) FROM LOG_SESSION_ADAPTER WHERE SESSIONSTARTTIME > '${SQL_DATE}' AND WORKFLOW_TYPE='${TYPE}' GROUP BY DATEFORMAT(sessionstarttime, 'YY-mm-dd:hh') ORDER BY DATEFORMAT(sessionstarttime, 'YY-mm-dd:hh')
+EOF
+    if [ -z ${DC_PW} ] || [ -z ${IQPORT} ] ; then
+        log "Adapter Log not created as either DC_PW or IQPORT is empty"
+        return 0;
+    else
+        $_DBISQL -nogui -d1 -c "uid=dc;pwd=${DC_PW}" -host localhost -port ${IQPORT} -onerror exit ${OUTPUT_DIR}/adapter.${TYPE}.sql 2>&1 > ${OUTPUT_DIR}/adapter.${TYPE}.log
+    fi
+}
+
+collectEventsCounts() {
+    log "collecting events data"
+    UNDERSCORE_DATE=$(echo ${SQL_DATE_ONLY} | sed 's/-/_/g')
+    LOG_FILE_LIST=$(find /eniq/log/sw_log/engine -name "engine-${UNDERSCORE_DATE}.log" | grep EVENT_E)
+    if [ -r ${OUTPUT_DIR}/events.loaded ] ; then
+    rm -f ${OUTPUT_DIR}/events.loaded
+    fi
+    for LOG in ${LOG_FILE_LIST} ; do
+    cat ${LOG} | egrep 'Set loaded in total|Executing load table command for table' >> ${OUTPUT_DIR}/events.loaded
+    done
+}
+
+collectStreamingInstr() {
+    log "collecting event streaming data"
+    if [ ! -d ${OUTPUT_DIR}/streaming ] ; then
+    mkdir ${OUTPUT_DIR}/streaming
+    fi
+
+    YESTERDAY=$($_PERL -e 'use POSIX qw(strftime); print strftime "%Y%m%d",localtime(time()- 3600*24);')
+    for TYPE in ctum ctr ; do
+    if [ -d /eniq/data/pmdata/eventdata/00/CTRS/${TYPE}_instrument ] ; then
+        if [ ! -d ${OUTPUT_DIR}/streaming/${TYPE} ] ; then
+        mkdir ${OUTPUT_DIR}/streaming/${TYPE}
+        fi
+        # Todays files
+        find /eniq/data/pmdata/eventdata/00/CTRS/${TYPE}_instrument -name "A${CCYYMMDD_DATE}*" -exec cp -f {} ${OUTPUT_DIR}/streaming/${TYPE} \;
+        # Last ROP from yesterday
+        find /eniq/data/pmdata/eventdata/00/CTRS/${TYPE}_instrument -name "A${YESTERDAY}.2300*" -exec cp -f {} ${OUTPUT_DIR}/streaming/${TYPE} \;
+    fi
+    done
+}
+
+
+collectServerAccessLogs() {
+    if [ -d /eniq/glassfish/glassfish/glassfish/domains/domain1/logs/access ] ; then
+    find /eniq/glassfish/glassfish/glassfish/domains/domain1/logs/access -name 'server_access_log.*' -mtime -1 -exec cp {} ${OUTPUT_DIR} \;
+    fi
+}
+
+removeOldEricDDDCEniqLogs() {
+    # Remove old ERICddc-ENIQ DDC log file older than 28 days
+    find /eniq/log/assureddc/ -mtime +28 -name "ERICddc-ENIQ*" -exec /bin/rm -f {} \;
+}
+
+collectStatsLogs() {
+    log "collecting stats data"
+    initSybase
+    if [ -z "${DC_PW}" ]  ; then
+        log "Adapter Log not created as DC_PW is empty"
+        return 0;
+    fi
+
+    #
+    # We use DATEADD to get the timestamp for yesterday @ 11PM. This is because the UpdateMonitoring job
+    # may not have updated the LOG_SESSION tables will all rows for yesterday when we ran the STOP job
+    # yesterday, i.e. we are trying to collect the last bit of yesterdays data today!
+    #
+    isql -s\; -w999 -b -Udc -P${DC_PW} -S${IQDBNAME} dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${OUTPUT_DIR}/statsAdapterTotals.log
+set nocount on
+go
+declare @today datetime
+select @today = '${SQL_DATE_ONLY} 00:00:00'
+select 'Today', DATEFORMAT(@today, "yyyy-mm-dd")
+SELECT convert(varchar(50), SOURCE) AS SOURCE, convert(varchar(70), TYPENAME) AS TYPENAME, COUNT(*),
+ CAST(ROUND(AVG(NUM_OF_ROWS),2) AS DECIMAL(18,2)) AS AVG_ROWS, MAX(NUM_OF_ROWS) AS MAX_ROWS, SUM(NUM_OF_ROWS) AS TOTAL_ROWS,
+ CAST(ROUND(AVG(NUM_OF_COUNTERS),2) AS DECIMAL(18,2)) AS AVG_CNTRS, MAX(NUM_OF_COUNTERS) AS MAX_CNTRS, SUM(NUM_OF_COUNTERS) AS TOTAL_CNTRS, count(distinct(DATEFORMAT(ROP_STARTTIME,'yyyy-MM-dd hh:mm'))) AS NumberOfROP, convert(varchar(50), WORKFLOW_TYPE) AS WORKFLOW_TYPE
+FROM LOG_SESSION_ADAPTER
+WHERE ROP_STARTTIME BETWEEN @today AND DATEADD(ss, -1, DATEADD(day,1,@today))
+GROUP BY SOURCE, TYPENAME, WORKFLOW_TYPE
+ORDER BY SOURCE, TYPENAME
+go
+declare @yesterday datetime
+select @yesterday = DATEADD(day,-1,'${SQL_DATE_ONLY} 00:00:00')
+select 'Yesterday', DATEFORMAT(@yesterday, "yyyy-mm-dd")
+SELECT convert(varchar(50), SOURCE) AS SOURCE, convert(varchar(70), TYPENAME) AS TYPENAME, COUNT(*),
+  CAST(ROUND(AVG(NUM_OF_ROWS),2) AS DECIMAL(18,2)) AS AVG_ROWS, MAX(NUM_OF_ROWS) AS MAX_ROWS, SUM(NUM_OF_ROWS) AS TOTAL_ROWS,
+  CAST(ROUND(AVG(NUM_OF_COUNTERS),2) AS DECIMAL(18,2)) AS AVG_CNTRS, MAX(NUM_OF_COUNTERS) AS MAX_CNTRS, SUM(NUM_OF_COUNTERS) AS TOTAL_CNTRS, count(distinct(DATEFORMAT(ROP_STARTTIME,'yyyy-MM-dd hh:mm'))) AS NumberOfROP, convert(varchar(50), WORKFLOW_TYPE) AS WORKFLOW_TYPE
+FROM LOG_SESSION_ADAPTER
+WHERE ROP_STARTTIME BETWEEN @yesterday AND DATEADD(ss, -1, DATEADD(day,1,@yesterday))
+GROUP BY SOURCE, TYPENAME, WORKFLOW_TYPE
+ORDER BY SOURCE, TYPENAME
+go
+EOF
+
+    isql -s\; -w999 -b -Udc -P${DC_PW} -S${IQDBNAME} dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g' > ${OUTPUT_DIR}/statsAdapterSession.log
+set nocount on
+go
+SELECT
+ SESSION_ID,convert(varchar(50), SOURCE) AS SOURCE,
+ DATEFORMAT(MIN(SESSIONSTARTTIME), "yyyy-mm-dd:hh:nn:ss") AS MIN_STARTTIME,
+ DATEFORMAT(MAX(SESSIONENDTIME), "yyyy-mm-dd:hh:nn:ss") AS MAX_ENDTIME,
+ SUM(NUM_OF_COUNTERS) AS TOTAL_CNTRS, convert(varchar(50), WORKFLOW_TYPE) AS WORKFLOW_TYPE
+FROM LOG_SESSION_ADAPTER
+WHERE SESSIONSTARTTIME > DATEADD(hour,-1,'${SQL_DATE_ONLY} 00:00:00')
+AND WORKFLOW_TYPE NOT LIKE 'FRH'
+GROUP BY SESSION_ID,SOURCE, WORKFLOW_TYPE
+ORDER BY SESSION_ID,SOURCE
+go
+EOF
+
+    isql -s\; -w999 -b -Udc -P${DC_PW} -S${IQDBNAME} dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${OUTPUT_DIR}/statsLoaderSession.log
+set nocount on
+go
+SELECT
+ LOADERSET_ID, SUM(ROWCOUNT) AS TOTAL_ROWS,
+ DATEFORMAT(MIN(SESSIONSTARTTIME), "yyyy-mm-dd:hh:nn:ss") AS MIN_STARTTIME,
+ DATEFORMAT(MAX(SESSIONENDTIME), "yyyy-mm-dd:hh:nn:ss") AS MAX_ENDTIME,
+ TYPENAME
+FROM LOG_SESSION_LOADER
+WHERE
+ SESSIONSTARTTIME > DATEADD(hour,-1,'${SQL_DATE_ONLY} 00:00:00')
+GROUP BY LOADERSET_ID, TYPENAME
+ORDER BY LOADERSET_ID
+go
+EOF
+
+    isql -s\; -w999 -b -Udc -P${DC_PW} -S${IQDBNAME} dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${OUTPUT_DIR}/statsAggregatorSession.log
+set nocount on
+go
+SELECT
+ DATEFORMAT(SESSIONSTARTTIME, "yyyy-mm-dd:hh:nn:ss") AS STARTTIME,
+ DATEFORMAT(SESSIONENDTIME, "yyyy-mm-dd:hh:nn:ss") AS  ENDTIME,
+ TYPENAME, TIMELEVEL, ROWCOUNT,
+ STATUS, FLAG
+FROM LOG_SESSION_AGGREGATOR
+WHERE
+ SESSIONSTARTTIME > DATEADD(hour,-1,'${SQL_DATE_ONLY} 00:00:00')
+go
+EOF
+
+}
+
+iqdbspace() {
+    initSybase
+    [ -z "${IQDBNAME}" ] && return
+    log "Collecting iqdbspace data"
+    isql -s\; -w999 -b -Udba -P${DBA_PW} -S${IQDBNAME} dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g' > ${OUTPUT_DIR}/iqdbspace.txt
+set nocount on
+go
+sp_iqdbspace
+go
+EOF
+}
+
+iqfile() {
+    initSybase
+    [ -z "${IQDBNAME}" ] && return
+    log "Collecting iqfile data"
+    isql -s\; -w999 -b -Udba -P${DBA_PW} -S${IQDBNAME} dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g' > ${OUTPUT_DIR}/iqfile.txt
+set nocount on
+go
+sp_iqfile
+go
+EOF
+}
+
+iqconnection() {
+    $_ECHO "${DATE}:${TIME}" >> ${OUTPUT_DIR}/iqconnection.txt
+    initSybase
+    [ -z "${IQDBNAME}" ] && return
+    log "Collecting iqconnection data"
+    isql -s\; -w999 -b -Udba -P${DBA_PW} -S${IQDBNAME} dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g' >> ${OUTPUT_DIR}/iqconnection.txt
+set nocount on
+go
+sp_iqconnection
+go
+EOF
+}
+
+listRawDevices() {
+    SERVER_DIR=$1
+
+    RAW_FILE=${SERVER_DIR}/rawdevices.eniq_iq
+    if [ -r ${RAW_FILE} ] ; then
+    ${_RM} -f ${RAW_FILE}
+    fi
+
+    DB_FILES=`${_CAT} ${OUTPUT_DIR}/iqfile.txt | tr -d '[:blank:]' | ${_AWK} '{ if ( $0 ~ /;$/ ) { print $0;} else { printf "%s", $0; } }' | ${_EGREP} '^;'`
+    for DB_FILE in ${DB_FILES} ; do
+    FILE_PATH=`${_ECHO} ${DB_FILE} | ${_AWK} -F\; '{print $4}'`
+    if [ -L ${FILE_PATH} ] ; then
+        LINK_TARGET=`${_LS} -l ${FILE_PATH} | ${_AWK} '{print $NF}'`
+        ${_ECHO} "${LINK_TARGET}" | ${_EGREP} '^/dev/rdsk/' > /dev/null
+        if [ $? -eq 0 ] ; then
+        DB_SPACE_NAME=`${_ECHO} ${DB_FILE} | ${_AWK} -F\; '{print $2}'`
+        DB_FILE_NAME=`${_ECHO} ${DB_FILE} | ${_AWK} -F\; '{print $3}'`
+        ${_ECHO} "${LINK_TARGET};${DB_SPACE_NAME} ${DB_FILE_NAME}" >> ${RAW_FILE}
+        fi
+    fi
+    done
+}
+
+getIqMonLogNames() {
+    # XXX: be careful with printout statements in this function. The output is used directly
+    # as a file list to copy from place to place
+    if [ -r ${OUTPUT_DIR}/mon.sql ] ; then
+        if [ -r "${OUTPUT_DIR}/iqcheckoptions.log" ] ; then
+            MON_OUT_DIR=$($_AWK '$2 ~ /^Monitor_Output_Directory$/ {print $3 ; exit}' ${OUTPUT_DIR}/iqcheckoptions.log)
+            if [ -z "${MON_OUT_DIR}" ] ; then
+                # fscking Sybase IQ changed the format of the iqcheckoptions output.
+                MON_OUT_DIR=$($_AWK '$2 ~ /^Monitor_Output_Directory$/ { getline ; print $1 ; exit}' ${OUTPUT_DIR}/iqcheckoptions.log)
+            fi
+        fi
+        if [ -z "${MON_OUT_DIR}" ] ; then
+            if [ -d "${IQ_DB_DIR}" ] ; then
+                MON_OUT_DIR=${IQ_DB_DIR}
+            else
+                return
+            fi
+        fi
+        if [ -d "${MON_OUT_DIR}" ] ; then
+            MON_FILE=$($_FIND ${MON_OUT_DIR} -name \*ddc_${DATE}_${HOSTNAME})
+            echo $MON_FILE
+        fi
+    fi
+}
+
+collectIqMonLogs() {
+    [ ! -d ${OUTPUT_DIR}/iqmon ] && $_MKDIR ${OUTPUT_DIR}/iqmon
+    for file in $(getIqMonLogNames) ; do
+        [ -f ${file} ] && [ -r ${file} ] && $_CP ${file} ${OUTPUT_DIR}/iqmon
+    done
+}
+
+cleanupIqMonDdcLogs() {
+    IQ_DBNAME="dwhdb"
+    # Normally these get deleted during the stop, this is a just in case
+    $_FIND /eniq/database/dwh_main -type f -name "${IQ_DBNAME}.*-ddc_??????_${HOSTNAME}*" -mtime +1 -exec rm -f {} \;
+    $_FIND /eniq/database/dwh_reader -type f -name "${IQ_DBNAME}.*-ddc_??????_${HOSTNAME}*" -mtime +1 -exec rm -f {} \;
+}
+
+iqmonitor() {
+    NO_IQ_MON_LOGS=${DATAROOT}/config/NO_IQ_MON_LOGS
+
+    initSybase
+    TASKS=$($_PS -ef | $_GREP "${MONITORDIR}/monitorTasks SHUTDOWN" | $_GREP -v grep)
+    [ -z "${IQDBNAME}" ] || [ ! -z "${TASKS}" ] && return
+
+    log "Starting dbisql monitor for Sybase IQ engine ${IQDBNAME}"
+    INTERVAL=60
+    isql -w999 -Udba -P${DBA_PW} -S${IQDBNAME} dwhdb <<EOF > ${OUTPUT_DIR}/iqcheckoptions.log 2>&1 &
+sp_iqcheckoptions
+go
+EOF
+
+    # TODO: improve this so that we can stop it at any time.
+    cat > ${OUTPUT_DIR}/mon.sql <<EOF
+BEGIN
+DECLARE endtime DATETIME ;
+DECLARE LOCAL TEMPORARY TABLE DUMMY_MONITOR (DUMMY_COLUMN INTEGER) ;
+
+SET endtime = DATETIME( '${SQL_DATE_ONLY} 23:58:00' );
+
+IQ UTILITIES MAIN INTO DUMMY_MONITOR START MONITOR '-summary -append -interval ${INTERVAL} -file_suffix ddc_${DATE}_${HOSTNAME}' ;
+
+WHILE GETDATE() < endtime LOOP
+    WAITFOR DELAY '00:01:00' ;
+    ROLLBACK ;
+END LOOP ;
+
+IQ UTILITIES MAIN INTO DUMMY_MONITOR STOP MONITOR ;
+
+DROP TABLE DUMMY_MONITOR ;
+END
+go
+EOF
+
+#
+# ENIQ 11 WP00289 - Add DDC support for SybaseIQ and CLARiiON instrumentation [CR #: 380/109 18-FCP 103 8147/12]
+#
+    cat > ${OUTPUT_DIR}/mon_io.sql <<EOF
+BEGIN
+DECLARE endtime DATETIME ;
+DECLARE LOCAL TEMPORARY TABLE DUMMY_MONITOR (DUMMY_COLUMN INTEGER) ;
+
+SET endtime = DATETIME( '${SQL_DATE_ONLY} 23:58:00' );
+
+IQ UTILITIES MAIN INTO DUMMY_MONITOR START MONITOR '-io -append -interval ${INTERVAL} -file_suffix ddc_${DATE}_${HOSTNAME}.io';
+IQ UTILITIES PRIVATE INTO DUMMY_MONITOR START MONITOR '-io -append -interval ${INTERVAL} -file_suffix ddc_${DATE}_${HOSTNAME}.io';
+
+WHILE GETDATE() < endtime LOOP
+    WAITFOR DELAY '00:01:00' ;
+    ROLLBACK ;
+END LOOP ;
+
+IQ UTILITIES MAIN INTO DUMMY_MONITOR STOP MONITOR ;
+IQ UTILITIES PRIVATE INTO DUMMY_MONITOR STOP MONITOR ;
+
+DROP TABLE DUMMY_MONITOR ;
+END
+go
+EOF
+
+    cat > ${OUTPUT_DIR}/mon_debug.sql <<EOF
+BEGIN
+DECLARE endtime DATETIME ;
+DECLARE LOCAL TEMPORARY TABLE DUMMY_MONITOR (DUMMY_COLUMN INTEGER) ;
+
+SET endtime = DATETIME( '${SQL_DATE_ONLY} 23:58:00' );
+
+IQ UTILITIES MAIN INTO DUMMY_MONITOR START MONITOR '-debug -append -interval ${INTERVAL} -file_suffix ddc_${DATE}_${HOSTNAME}.debug';
+IQ UTILITIES PRIVATE INTO DUMMY_MONITOR START MONITOR '-debug -append -interval ${INTERVAL} -file_suffix ddc_${DATE}_${HOSTNAME}.debug';
+
+WHILE GETDATE() < endtime LOOP
+    WAITFOR DELAY '00:01:00' ;
+    ROLLBACK ;
+END LOOP ;
+
+IQ UTILITIES MAIN INTO DUMMY_MONITOR STOP MONITOR ;
+IQ UTILITIES PRIVATE INTO DUMMY_MONITOR STOP MONITOR ;
+
+DROP TABLE DUMMY_MONITOR ;
+END
+go
+EOF
+
+    if [ -z ${DBA_PW} ] || [ -z ${IQPORT} ] ; then
+        log "Mon Log not created as either DBA_PW or IQPORT is empty"
+        return 0;
+    else
+        _conn_str_user_dba_="-c \"uid=dba;pwd=${DBA_PW}\""
+        rm -rf /var/tmp/conn_str_encrypt.txt.*
+        _conn_str_user_dba_enc=/var/tmp/conn_str_encrypt.txt.$$
+        get_encrypted_file "${_conn_str_user_dba_}" "${_conn_str_user_dba_enc}"
+        $_DBISQL -nogui -d1 @${_conn_str_user_dba_enc} -host localhost -port ${IQPORT} -onerror exit ${OUTPUT_DIR}/mon.sql 2>&1 >> ${OUTPUT_DIR}/mon.log &
+        echo $! > ${OUTPUT_DIR}/dbisql.pid
+        if [ ! -f ${NO_IQ_MON_LOGS} ] ; then
+            get_encrypted_file "${_conn_str_user_dba_}" "${_conn_str_user_dba_enc}"
+            $_DBISQL -nogui -d1 @${_conn_str_user_dba_enc} -host localhost -port ${IQPORT} -onerror exit ${OUTPUT_DIR}/mon_io.sql 2>&1 >> ${OUTPUT_DIR}/mon_io.log &
+            echo $! >> ${OUTPUT_DIR}/dbisql.pid
+            get_encrypted_file "${_conn_str_user_dba_}" "${_conn_str_user_dba_enc}"
+            $_DBISQL -nogui -d1 @${_conn_str_user_dba_enc} -host localhost -port ${IQPORT} -onerror exit ${OUTPUT_DIR}/mon_debug.sql 2>&1 >> ${OUTPUT_DIR}/mon_debug.log &
+            echo $! >> ${OUTPUT_DIR}/dbisql.pid
+        fi
+    fi
+}
+
+getIqmonPID() {
+    PIDLIST=""
+    PID=""
+    #try to read the PID file
+    [ -f ${OUTPUT_DIR}/dbisql.pid ] && PIDLIST=$($_CAT ${OUTPUT_DIR}/dbisql.pid)
+    if [ ! -z "${PIDLIST}" ] ; then
+        for CHECKPID in ${PIDLIST} ; do
+            # check if this is an SMF service
+            DDC_PID=`service ddc status | awk '{print $4}'`
+            TMPPID=`ps fax ${DDC_PID} | awk '{print $1}' | grep -w ${CHECKPID}`
+            PID="${PID} ${TMPPID}"
+        done
+    else
+        log "dbisql.pid is empty or unable to access it"
+    fi
+    echo ${PID}
+}
+
+stopIqmonitor() {
+    MON_PID=$(getIqmonPID)
+    if [ ! -z "${MON_PID}" ] ; then
+        # may be more than one PID returned if the previous day's monitor was not terminated properly
+        for pid in ${MON_PID} ; do
+            log "Stopping IQ monitor: PID ${pid}"
+            # send a kill signal to the dbisql process
+            $_KILL ${pid}
+        if [ $? != 0 ]; then
+        log "Unable to kill process using KILL PID"
+        fi
+            COUNT=0
+            # wait a maximum of 10 seconds for the process to exit
+            while [ -d /proc/${pid} ] && [ $COUNT -lt 10 ] ; do
+                sleep 1
+                let COUNT=$COUNT+1
+            done
+            # if the process is still there, forcibly kill it
+            if [ -d /proc/${pid} ] ; then
+                $_KILL -9 ${pid}
+                if [ $? != 0 ]; then
+                log "Unable to kill process using KILL -9 PID"
+                fi
+            fi
+        done
+    else
+    log "No more iqmonitor process available to stop"
+    fi
+}
+
+# Collect tar files from other systems in ENIQ Events if applicable
+collectPeerArchives() {
+    # DATAROOT is based on hostnames, hopeully
+    [ "$($_BASENAME ${DATAROOT})" != "${THISHOST}" ] && return
+
+    SERVER_BASEDIR="${OUTPUT_DIR}/eniq_events_servers"
+    if [ ! -d "${SERVER_BASEDIR}" ] ; then
+        $_MKDIR ${SERVER_BASEDIR} || die "Could not make ${SERVER_BASEDIR}"
+    fi
+
+    # Only include valid dir's in the list of hosts
+    # so that we ignore other dirs like config, lost+found, etc.
+    ENIQ_HOSTS=""
+    DIR_LIST=$($_LS ${BASE_DATAROOT})
+    for DIR in ${DIR_LIST} ; do
+    if [ "${DIR}" != "${THISHOST}" ] ; then
+        if [ -d "${BASE_DATAROOT}/${DIR}/${DATE}" ] || [ -r ${BASE_DATAROOT}/${DIR}/DDC_Data_${DATE}.tar.gz ] ; then
+        ENIQ_HOSTS="${ENIQ_HOSTS} ${DIR}"
+        fi
+    fi
+    done
+
+    TESTFILE=/tmp/test_age.$$
+    LOOP_COUNT=0
+    MAX_RETRIES=10
+    while [ ! -z "${ENIQ_HOSTS}" ] && [ ${LOOP_COUNT} -lt ${MAX_RETRIES} ] ; do
+        $_TOUCH ${TESTFILE} || die "Could not create ${TESTFILE}"
+        # wait one minute so we allow tar file creation to complete
+        $_SLEEP 60
+        REMAINING_HOSTS=""
+        for ENIQ_HOST in ${ENIQ_HOSTS} ; do
+            if [ -d "${BASE_DATAROOT}/${ENIQ_HOST}" ] ; then
+                # collect tar file
+                progress "Checking ${ENIQ_HOST} for archive files"
+                if [ ! -d "${SERVER_BASEDIR}/${ENIQ_HOST}" ] ; then
+                    $_MKDIR ${SERVER_BASEDIR}/${ENIQ_HOST} || die "Could not make ${SERVER_BASEDIR}/${ENIQ_HOST}"
+                fi
+                TODAYS_FILE="${BASE_DATAROOT}/${ENIQ_HOST}/DDC_Data_${DATE}.tar.gz"
+                ALL_FILES=$($_LS ${BASE_DATAROOT}/${ENIQ_HOST}/DDC_Data_*.tar.gz)
+                FOUND_TODAY=false
+                for file in ${ALL_FILES} ; do
+                    # check tar file is not being modified
+                    if [ "${file}" -ot "${TESTFILE}" ] ; then
+                        if [ "${file}" = "${TODAYS_FILE}" ] ; then
+                            FOUND_TODAY=true
+                        fi
+                        progress "collecting ${file}"
+                        $_MV ${file} ${SERVER_BASEDIR}/${ENIQ_HOST}
+                    fi
+                done
+                if [ "${FOUND_TODAY}" = "false" ] ; then
+                    REMAINING_HOSTS="${REMAINING_HOSTS} ${ENIQ_HOST}"
+                fi
+            fi
+        done
+        ENIQ_HOSTS=${REMAINING_HOSTS}
+        let LOOP_COUNT=($LOOP_COUNT+1)
+    done
+
+    if [ ! -z "${ENIQ_HOSTS}" ] ; then
+        warn "missed collecting an archive file for today from: ${ENIQ_HOSTS}"
+    fi
+}
+
+jvm_monitor() {
+    SRCDIR=${UTILDIR}/etc/instr
+
+    ODIR=${DATAROOT}/${DATE}/instr
+    if [ ! -d ${ODIR} ] ; then
+        $_MKDIR ${ODIR}
+    fi
+    $_CHMOD 755 ${ODIR}
+
+    #ENIQ_SRV=`$_SVCS -H -o fmri,state 'svc:/eniq/*' | awk '{if ($2 != "disabled" ) { print $1; }}' | $_SED -e 's|svc:/eniq/||' -e 's/:default//'`
+    ENIQ_SRV=`systemctl list-unit-files | grep 'eniq-*' | grep -v 'UNIT FILE|STATE' | awk '{if ($2 != "disabled" ) { print $1; }}' | sed -e 's|eniq-||' -e 's/.service//'`
+
+    $_ECHO ${ENIQ_SRV} | $_GREP glassfish > /dev/null
+    if [ $? -eq 0 ] ; then
+    $_CP ${SRCDIR}/xml/glassfish.xml ${ODIR}/glassfish.xml
+    fi
+}
+
+#
+# ENIQ 12 WP00155 - Collect and present collection and processing times for event files [CR #: 42/109 18-FCP 103 8147/14 A]
+# [2012-01-25 eronkeo]
+#
+eventLog() {
+    log "collecting collection and processing times for event files"
+    cat > ${OUTPUT_DIR}/collection_events.sql <<EOF
+SELECT WORKFLOW_TYPE,
+WORKFLOW_NAME,
+count(*) AS Count,
+truncnum(cast(avg(datediff(ss,sessionstarttime,sessionendtime)) AS float),4) AS 'Average Duration',
+max(datediff(ss,sessionstarttime,sessionendtime)) AS 'Maximum Duration'
+FROM LOG_SESSION_ADAPTER
+WHERE SESSIONSTARTTIME > '${SQL_DATE_ONLY}'
+AND WORKFLOW_TYPE != ' '
+AND WORKFLOW_NAME != ' '
+GROUP BY WORKFLOW_NAME, WORKFLOW_TYPE
+ORDER BY WORKFLOW_NAME;
+OUTPUT TO ${OUTPUT_DIR}/collection_events.log
+EOF
+    if [ -z ${DC_PW} ] || [ -z ${IQPORT} ] ; then
+        log "Events Log not created as either DC_PW or IQPORT is empty"
+        return 0;
+    else
+        $_DBISQL -nogui -d1 -c "uid=dc;pwd=${DC_PW}" -host localhost -port ${IQPORT} -onerror exit ${OUTPUT_DIR}/collection_events.sql
+    fi
+}
+
+genericJMX() {
+    NAME="$1"
+    SEARCH="$2"
+
+    $_SED "s/SEARCH_STRING/${SEARCH}/" ${SRCDIR}/templates/genericJmx.template.xml | \
+        $_SED "s/OUTPUT_NAME/${NAME}/" > ${ODIR}/genjmx_${NAME}.xml
+}
+
+monitorMZ() {
+    if [ -x /eniq/sw/bin/ec ] ; then
+    EC_LIST=$(su - dcuser -c "/eniq/sw/bin/ec status" | grep 'is running' | awk '{print $1}')
+    for EC in ${EC_LIST} ; do
+        LC_EC=$(echo ${EC} | tr [A-Z] [a-z])
+        genericJMX ${EC} ".*oom ${LC_EC} .*"
+    done
+
+    echo "${EC_LIST}" | grep -w EC2 > /dev/null
+    if [ $? -eq 0 ] ; then
+        cp ${SRCDIR}/xml/ee_ctr_ctum_stream.xml ${ODIR}
+    fi
+    fi
+}
+
+collectMzLogs() {
+    LOG_DIR=/eniq/log/sw_log/mediation_gw/wfinstr
+    for FILE in wfexec.log wfinstr.log ; do
+    if [ -r ${LOG_DIR}/${FILE} ] ; then
+        find ${LOG_DIR} -name "${FILE}*" -mtime -1 -exec cp {} ${OUTPUT_DIR} \;
+        find ${LOG_DIR} -name "${FILE}*" -mtime +2 -exec rm -f {}  \;
+    fi
+    done
+}
+
+collectEngineLogs() {
+    FILE_DATE=$(echo ${SQL_DATE_ONLY} | sed 's/-/_/g')
+    if [ -r /eniq/log/sw_log/engine/EVENTS_DWH_BASE/engine-${FILE_DATE}.log ] ; then
+    cp -f /eniq/log/sw_log/engine/EVENTS_DWH_BASE/engine-${FILE_DATE}.log ${OUTPUT_DIR}/engine-EVENTS_DWH_BASE.log
+    fi
+}
+
+startRLA() {
+    # Make sure we clearout any exist rla cfg, otherwise we'll end up with multiple
+    # entires for the same log if ddc is restared during the day.
+    if [ -r ${OUTPUT_DIR}/rla.cfg ] ; then
+        log "Removing the existing old rla.cfg file"
+    $_RM -f ${OUTPUT_DIR}/rla.cfg
+    fi
+
+    # Disable collection of CEP logs, they are too large
+    #if [ "${ENIQ_SERVER_TYPE}" = "eniq_cep" ] ; then
+    #   if [ -r /var/log/ericsson/cep-mediation/cep-mediation.log ] ; then
+    #        $_ECHO "${OUTPUT_DIR}/cep-mediation.log,/var/log/ericsson/cep-mediation/cep-mediation.log,2" >>  ${OUTPUT_DIR}/rla.cfg
+    #   fi
+    #fi
+
+    if [ -r ${OUTPUT_DIR}/rla.cfg ] ; then
+        NUM_LINES=$($_WC -l ${OUTPUT_DIR}/rla.cfg | $_AWK '{print $1}')
+        if [ $NUM_LINES -gt 0 ] ; then
+            log "Starting RLA"
+            ${MONITORDIR}/common/scripts/rla --cfg ${OUTPUT_DIR}/rla.cfg \
+                --exit ${OUTPUT_DIR}/rla.exit \
+                --interval 30 \
+                --maxtime 25 >> ${OUTPUT_DIR}/rla.log 2>&1 &
+        else
+        # Remove empty file
+            log "rla.cfg is not updated with the files to be collected"
+        $_RM -f ${OUTPUT_DIR}/rla.cfg
+    fi
+    else
+        log "rla.cfg has no read access"
+    fi
+}
+
+stopDaemons() {
+    if [ -r ${OUTPUT_DIR}/rla.cfg ] ; then
+    $_TOUCH ${OUTPUT_DIR}/rla.exit
+    fi
+}
+
+parseCedMedLog() {
+    if [ -r ${OUTPUT_DIR}/cep-mediation.log ] ; then
+        ${ENIQ_MONITORDIR}/parseCepMediation --log ${OUTPUT_DIR}/cep-mediation.log --date ${SQL_DATE_ONLY} > ${OUTPUT_DIR}/cep-mediation.log.parsed
+        EXCLUDE_FILES="${EXCLUDE_FILES} ${OUTPUT_DIR}/cep-mediation.log"
+    fi
+}
+
+loaderAggregator() {
+
+    # Global Variables
+    ############################################################################
+    output_log_location="/eniq/log/assureddc"
+    date=$(date +%Y_%m_%d)
+    error_log=/eniq/log/sw_log/engine/error-${date}.log
+    sql_error_log=/eniq/log/sw_log/engine/sqlerror-${date}.log
+    hostname=`/usr/bin/hostname`
+
+    ############################################################################
+    # Subroutine  : manage_log_file
+    # Description : Cleans up all the old log files related to failed loader/aggregator
+    #             : sets and loader sets with delimiter error.
+    # Arguments   : msg
+    # Returns     : N/A
+    ############################################################################
+    manage_log_file() {
+        log_msg "INFO: Removing the old log files related to failed aggregator and loader sets."
+        ${FIND} ${output_log_location}/loaderAggregatorSetFailure -name "*.txt" | xargs ${RM} -f;
+    }
+
+    ############################################################################
+    # Subroutine  : log_msg
+    # Description : Logs to ERICddc-ENIQ.log.YYYY-MM-DD
+    # Arguments   : String to be written to the log
+    # Returns     : N/A
+    ############################################################################
+    log_msg() {
+        logging_timestamp=`date '+%Y-%m-%d %H:%M:%S'`
+        log_file="${output_log_location}/ERICddc-ENIQ.log.$(date +%Y-%m-%d)"
+        ${ECHO} "${logging_timestamp} ${HOSTNAME} ${0} ${1}" >> "${log_file}"
+    }
+
+    collect_loaderAggregatorFailedSet_logfile() {
+        LOADERAGGREGATORFAILEDSET_LOG_FILE=$(find ${output_log_location}/loaderAggregatorSetFailure -name "loaderAggregatorSetFailure_${SQL_DATE_ONLY}.txt")
+        DELIMITER_ERROR_LOADERSET_LOG_FILE=$(find ${output_log_location}/loaderAggregatorSetFailure -name "delimiterErrorLoaderSet_${SQL_DATE_ONLY}.txt")
+        IBS_ERROR_LOADERSET_LOG_FILE=$(find ${output_log_location}/loaderAggregatorSetFailure -name "IBSErrorLoaderSet_${SQL_DATE_ONLY}.txt")
+        if [ -n "${LOADERAGGREGATORFAILEDSET_LOG_FILE}" ] || [ -n "${DELIMITER_ERROR_LOADERSET_LOG_FILE}" ] || [ -n "${IBS_ERROR_LOADERSET_LOG_FILE}" ]; then
+            if [ ! -d ${PLUGIN_DATA_DIR}/loaderAggregatorSetFailure ] ; then
+                mkdir ${PLUGIN_DATA_DIR}/loaderAggregatorSetFailure
+            fi
+            if [ -n "${LOADERAGGREGATORFAILEDSET_LOG_FILE}" ]; then
+                log "Collecting LoaderAggregatorFailedSet log under plugin_data directory"
+                cp ${LOADERAGGREGATORFAILEDSET_LOG_FILE} ${PLUGIN_DATA_DIR}/loaderAggregatorSetFailure
+            fi
+            if [ -n "${DELIMITER_ERROR_LOADERSET_LOG_FILE}" ]; then
+                log "Collecting Loader Set with delimiter error log under plugin_data directory"
+                cp ${DELIMITER_ERROR_LOADERSET_LOG_FILE} ${PLUGIN_DATA_DIR}/loaderAggregatorSetFailure
+            fi
+            if [ -n "${IBS_ERROR_LOADERSET_LOG_FILE}" ]; then
+                log "Collecting IBS Error loader set log under plugin_data directory"
+                cp ${IBS_ERROR_LOADERSET_LOG_FILE} ${PLUGIN_DATA_DIR}/loaderAggregatorSetFailure
+            fi
+            $_CHMOD 644 ${PLUGIN_DATA_DIR}/loaderAggregatorSetFailure/*
+        fi
+    }
+
+    ###########################################################################
+    # Main
+    ###########################################################################
+
+    if [ ! -d "${output_log_location}/loaderAggregatorSetFailure" ]; then
+        log_msg "INFO: Creating log directory ${output_log_location}/loaderAggregatorSetFailure"
+        ${MKDIR} -p ${output_log_location}/loaderAggregatorSetFailure
+        if [ ${?} -ne 0 ]; then
+            log_msg "ERROR: Unable to create the output log dir.. Stopping script execution.."
+            return 1
+        fi
+    fi
+
+    manage_log_file
+
+    # Description : Filters /eniq/log/sw_log/engine/error-YYYY_MM_DD.log based on error conditions
+    log_msg "INFO: Retrieving failed loader and aggregator sets information."
+    `${GREP} -i EngineException ${error_log} > ${output_log_location}/loaderAggregatorSetFailure/loaderAggregatorSetFailure_$(date +%Y-%m-%d).txt`
+    if [ ${?} -ne 0 ] ; then
+        log_msg "INFO: No failed set information found in the logs."
+        `${RM} -f ${output_log_location}/loaderAggregatorSetFailure/loaderAggregatorSetFailure_*.txt`
+    fi
+
+    log_msg "INFO: Retrieving Loader sets information which got failed with the delimiter error (row/column) only"
+    `${GREP} -B 1 "delim" ${error_log} | ${GREP} "Nested exception" > ${output_log_location}/loaderAggregatorSetFailure/delimiterErrorLoaderSet_$(date +%Y-%m-%d).txt`
+    if [ ${?} -ne 0 ] ; then
+        log_msg "INFO: No Loader sets with delimiter error found in the logs."
+        `${RM} -f ${output_log_location}/loaderAggregatorSetFailure/delimiterErrorLoaderSet_*.txt`
+    fi
+
+    log_msg "INFO: Retrieving Loader sets information which got failed with insufficient buffer sort error."
+    `${GREP} -i insufficient ${sql_error_log} > ${output_log_location}/loaderAggregatorSetFailure/IBSErrorLoaderSet_${SQL_DATE_ONLY}.txt`
+    if [ ${?} -ne 0 ] ; then
+        log_msg "INFO: No Loader sets with insufficient buffer sort error found in the logs."
+        `${RM} -f ${output_log_location}/loaderAggregatorSetFailure/IBSErrorLoaderSet_*.txt`
+    fi
+
+    collect_loaderAggregatorFailedSet_logfile
+}
+
+collectHeapMemoryAndEngineCertificateLogs() {
+    log "Executing heap memory and engine certificate logs collection"
+    ENGINE_LOG_FILE=$(find /eniq/log/sw_log/engine -name "engineHeap-${SQL_DATE_ONLY}.log")
+    SCHEDULER_LOG_FILE=$(find /eniq/log/sw_log/scheduler -name "schedulerHeap-${SQL_DATE_ONLY}.log")
+    ENGINE_CERTIFICATE_LOG_FILE=$(find /eniq/log/sw_log/engine -name "Certificate_Expiry_${SQL_DATE_ONLY}.log")
+    if [ -n "${ENGINE_LOG_FILE}" ] || [ -n "${SCHEDULER_LOG_FILE}" ] || [ -n "${ENGINE_CERTIFICATE_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/heapMemory ] ; then
+            mkdir ${PLUGIN_DATA_DIR}/heapMemory
+        fi
+        log "Collecting heap memory engine logs under plugin_data directory"
+        if [ -n "${ENGINE_LOG_FILE}" ]; then
+            cp ${ENGINE_LOG_FILE} ${PLUGIN_DATA_DIR}/heapMemory
+        fi
+        log "Collecting heap memory scheduler logs under plugin_data directory"
+        if [ -n "${SCHEDULER_LOG_FILE}" ]; then
+            cp ${SCHEDULER_LOG_FILE} ${PLUGIN_DATA_DIR}/heapMemory
+        fi
+        log "Collecting engine certificate log under plugin_data directory"
+        if [ -n "${ENGINE_CERTIFICATE_LOG_FILE}" ]; then
+            cp ${ENGINE_CERTIFICATE_LOG_FILE} ${PLUGIN_DATA_DIR}/heapMemory
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/heapMemory/*
+    fi
+}
+
+techpackDetailsCollection() {
+
+    # Global Variables
+    ############################################################################
+    DATE="/usr/bin/date"
+    output_log_location="/eniq/log/assureddc"
+    file_pattern="techpack_list"
+    tmp_file="/tmp/db_output.txt";
+    date=$(date +%Y-%m-%d)
+    command_to_write="select versionid, techpack_name, product_number, techpack_version, techpack_type, status, creationdate from
+    (select v.versionid, v.techpack_name, v.product_number, v.techpack_version, v.techpack_type, t.status, d.creationdate
+    from versioning v, tpactivation t, dwhtechpacks d where v.versionid *= t.versionid and v.versionid *= d.versionid union (SELECT VERSIONID,TECHPACK_NAME,PRODUCT_NUMBER,TECHPACK_VERSION,TYPE,STATUS,CREATIONDATE FROM MZTechPacks)) as results
+    where status='ACTIVE' order by techpack_name;
+    OUTPUT TO '/tmp/db_output.txt' APPEND FORMAT ASCII DELIMITED BY ';' QUOTE ''"
+    DWHREP_PW=`getIqPassword DWHREP`
+
+    ############################################################################
+    # Subroutine  : manage_log_file
+    # Description : Cleans up all the old techpack_list log files.
+    # Arguments   : msg
+    # Returns     : N/A
+    ############################################################################
+    manage_log_file() {
+        log_msg "INFO: Removing the old files of techpack_list log."
+        ${FIND} ${output_log_location} -name "*techpack_list*" | xargs ${RM} -f;
+        file_pattern_current_date="${file_pattern}_${date}.txt"
+    }
+
+    ############################################################################
+    # Subroutine  : create_queryfile
+    # Description : Creates a file needed for feeding into dbisql query.
+    # Arguments   : msg
+    # Returns     : N/A
+    ############################################################################
+    create_queryfile() {
+        if [ ! -s $output_log_location/techpack/query_file.sql ]; then
+            log_msg "INFO: Creating a file containing a query required for fetching techpack details."
+            ${ECHO} $command_to_write > $output_log_location/techpack/query_file.sql
+        fi
+    }
+
+    ############################################################################
+    # Subroutine  : get_version_for_admin_ui
+    # Description : Extracts the required Admin UI version from the given Version ID.
+    # Arguments   : version_id
+    # Returns     : Returns Admin UI version
+    ############################################################################
+    get_version_for_admin_ui() {
+        VERSION_ID=$1
+        INTERMEDIATE_VERSION_ID=`echo "${VERSION_ID#*((}"`
+        ADMIN_UI_VERSION=`echo "${INTERMEDIATE_VERSION_ID%))}"`
+        $ECHO  "${ADMIN_UI_VERSION}"
+    }
+
+    ############################################################################
+    # Subroutine  : prepare_techpack_details_logfile
+    # Description : Parses the temporary log file containing techpack details and prepares a new one in a required format.
+    # Arguments   : N/A
+    # Returns     : N/A
+    ############################################################################
+    prepare_techpack_details_logfile() {
+        current_timestamp=$(${DATE} +"%Y-%m-%d %T")
+        repdb_server_name="repdb"
+        repdb_host_name=$(${CAT} /etc/hosts | $GREP $repdb_server_name | $CUT -d ' ' -f 3)
+        port_number=2641
+
+        log_msg "INFO: Connecting to REPDB to fetch the techpack details."
+        ${SU} - dcuser -c "dbisql -nogui -c \"eng=$repdb_server_name;links=tcpip{host=$repdb_host_name;port=$port_number};uid=dwhrep;pwd=$DWHREP_PW\" \"$output_log_location/techpack/query_file.sql\"" > /dev/null 2>&1
+        ${CAT} $tmp_file | while read LINE
+        do
+            version_id=`${ECHO} "$LINE" | $AWK -F";" '{print $1}'`
+            techpack_name=`${ECHO} "$LINE" | $AWK -F";" '{print $2}'`
+            product_number=`${ECHO} "$LINE" | $AWK -F";" '{print $3}'`
+            techpack_version=`${ECHO} "$LINE" | $AWK -F";" '{print $4}'`
+            techpack_type=`${ECHO} "$LINE" | $AWK -F";" '{print $5}'`
+            status=`${ECHO} "$LINE" | $AWK -F";" '{print $6}'`
+            creation_date=`${ECHO} "$LINE" | $AWK -F";" '{print $7}'`
+
+            # Check to see if the techpack_version is of form IDE:R1A or SDK:R1A_b5
+            #For the SDK - It already has the techpack_version in the correct format.
+            if [[ "$techpack_version" != *"_"* ]]; then
+                admin_ui_version=`get_version_for_admin_ui $version_id`
+                if [[ "$admin_ui_version" == "b"* ]]; then
+                    techpack_version=${techpack_version}_${admin_ui_version}
+                else
+                    techpack_version=${techpack_version}_b${admin_ui_version}
+                fi
+            fi
+
+            if [[ -z $creation_date ]]; then
+                creation_date="N/A"
+            else
+                creation_date=`${ECHO} "$creation_date" | $SED -e 's/....$//'`
+            fi
+            ${ECHO} "$current_timestamp;$techpack_name;$product_number;$techpack_version;$techpack_type;$status;$creation_date" >> ${output_log_location}/techpack/$file_pattern_current_date
+        done
+        log_msg "INFO: Removing the temporary file."
+        ${RM} -rf /$tmp_file
+    }
+
+    ############################################################################
+    # Subroutine  : collect_techpack_logfile
+    # Description : collects the techpack details log file under plugin_data directory.
+    # Arguments   : N/A
+    # Returns     : N/A
+    ############################################################################
+    collect_techpack_logfile() {
+        log "collecting Techpack log under plugin_data directory"
+        TECHPACK_LOG_FILE=$(find ${output_log_location}/techpack -name "techpack_list_${SQL_DATE_ONLY}.txt")
+        if [ -n "${TECHPACK_LOG_FILE}" ]; then
+            if [ ! -d ${PLUGIN_DATA_DIR}/installed_techpacks ] ; then
+                mkdir ${PLUGIN_DATA_DIR}/installed_techpacks
+            fi
+            cp ${TECHPACK_LOG_FILE} ${PLUGIN_DATA_DIR}/installed_techpacks
+            $_CHMOD 644 ${PLUGIN_DATA_DIR}/installed_techpacks/*
+        fi
+    }
+
+    ############################################################################
+    # Subroutine  : log_msg
+    # Description : Logs to ERICddc-ENIQ.log
+    # Arguments   : String to be written to the log
+    # Returns     : N/A
+    ############################################################################
+    log_msg() {
+        logging_timestamp=`date '+%Y-%m-%d %H:%M:%S'`
+        log_file="${output_log_location}/ERICddc-ENIQ.log"
+        ${ECHO} "${logging_timestamp} ${0} ${1}" >> "${log_file}.${date}"
+    }
+
+    ###########################################################################
+    # Main
+    ###########################################################################
+
+    # Checking if somehow /tmp/db_output.txt file is not deleted and deleting this.
+    if [ -s $tmp_file ]; then
+        log_msg "INFO: Deleting the file for techpack if somehow it is not deleted."
+        ${RM} -rf $tmp_file
+    fi
+
+    log_msg "INFO: Collection of techpack list and other techpack details..."
+    if [ ! -d "${output_log_location}/techpack" ]; then
+        ${MKDIR} -p ${output_log_location}/techpack
+        if [ ${?} -ne 0 ]; then
+            log_msg "ERROR: Unable to create the output log dir.. Stopping script execution.."
+            return 1
+        fi
+    fi
+
+    create_queryfile
+    manage_log_file
+    prepare_techpack_details_logfile
+    collect_techpack_logfile
+}
+
+getWindowsDataMountedValue() {
+    IP_ADDRESS=$1
+    MOUNT_PATH=$2
+    WINDOWS_SERVER_TYPE=$3
+
+    if [[ $IP_ADDRESS =~ ":" ]]; then
+        IP_ADDRESS=[${IP_ADDRESS}]
+    fi
+
+    grep "${MOUNT_PATH}" /proc/mounts > /dev/null
+    if [ $? -eq 0 ]; then
+        umount -l ${MOUNT_PATH}
+    fi
+    grep "${MOUNT_PATH}" /etc/fstab > /dev/null
+    if [ $? -eq 0 ]; then
+        sed "/${WINDOWS_SERVER_TYPE}/d" /etc/fstab  > /tmp/tmpfile && mv /tmp/tmpfile /etc/fstab
+    fi
+    WINDOWS_DATA_MOUNTED=0
+    if [ -d ${MOUNT_PATH} ]; then
+        if [ "${WINDOWS_SERVER_TYPE}" = "BIS" ]; then
+            mount -t nfs ${IP_ADDRESS}:/DDC_logs ${MOUNT_PATH} -o ro,soft,vers=3,nosuid,nodev,nordirplus
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+            fi
+        elif [ "${WINDOWS_SERVER_TYPE}" = "netanserver" ]; then
+            mount -t nfs ${IP_ADDRESS}:/DDC ${MOUNT_PATH} -o ro,soft,vers=3,nosuid,nodev,nordirplus
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+            fi
+        elif [ "${WINDOWS_SERVER_TYPE}" = "OCS-Without-Citrix" ]; then
+            mount -t nfs ${IP_ADDRESS}:/C:/OCS-without-Citrix/DDC_logs  ${MOUNT_PATH} -o ro,soft,vers=3,nosuid,nodev,nordirplus
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+            fi
+        fi
+    else
+        mkdir -p ${MOUNT_PATH}
+        if [ "${WINDOWS_SERVER_TYPE}" = "BIS" ]; then
+            mount -t nfs ${IP_ADDRESS}:/DDC_logs ${MOUNT_PATH} -o ro,soft,vers=3,nosuid,nodev,nordirplus
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+            fi
+        elif [ "${WINDOWS_SERVER_TYPE}" = "netanserver" ]; then
+            mount -t nfs ${IP_ADDRESS}:/DDC ${MOUNT_PATH} -o ro,soft,vers=3,nosuid,nodev,nordirplus
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+            fi
+        elif [ "${WINDOWS_SERVER_TYPE}" = "OCS-Without-Citrix" ]; then
+            mount -t nfs ${IP_ADDRESS}:/C:/OCS-without-Citrix/DDC_logs  ${MOUNT_PATH} -o ro,soft,vers=3,nosuid,nodev,nordirplus
+            if [ $? -eq 0 ] ; then
+                WINDOWS_DATA_MOUNTED=1
+            fi
+        fi
+    fi
+
+    echo ${WINDOWS_DATA_MOUNTED}
+}
+
+collectBISLogs() {
+    log "Executing bis logs collection"
+    REQUIRED_DATE=`echo ${SQL_DATE_ONLY} | sed 's/-//g'`
+    BIS_MOUNT_PATH=/eniq/BIS
+    WINDOWS_SERVER_TYPE=BIS
+    BIS_FILE=`ls -lrt /eniq/installation/config/windows_server_conf_files | grep "BIS" | tr -s ' ' | cut -d ' ' -f9`
+    BIS_IP_ADDRESS=`echo $BIS_FILE | awk -F "-" '{print $2}'`
+    if [ -n "${BIS_IP_ADDRESS}" ]; then
+        BIS_DATA_MOUNTED=`getWindowsDataMountedValue $BIS_IP_ADDRESS $BIS_MOUNT_PATH $WINDOWS_SERVER_TYPE`
+        if [ ${BIS_DATA_MOUNTED} -eq 1 ] ; then
+            BIS_APPLICATION_LOG_FILE=$(find /eniq/BIS/application_logs/ -name "*${REQUIRED_DATE}.txt")
+            BIS_SYSTEM_LOG_FILE=$(find /eniq/BIS/system_logs/ -name "*_${REQUIRED_DATE}.tsv" && find /eniq/BIS/system_logs/  -name "hostname.tsv")
+            if [ -n "${BIS_APPLICATION_LOG_FILE}" ] || [ -n "${BIS_SYSTEM_LOG_FILE}" ]; then
+                if [ -n "${BIS_APPLICATION_LOG_FILE}" ]; then
+                    if [ ! -d ${PLUGIN_DATA_DIR}/bis_application ] ; then
+                        mkdir ${PLUGIN_DATA_DIR}/bis_application
+                    fi
+                    log "Collecting bis application logs under plugin_data directory"
+                    for LOG in ${BIS_APPLICATION_LOG_FILE} ; do
+                        cp $LOG ${PLUGIN_DATA_DIR}/bis_application
+                    done
+                    $_CHMOD 644 ${PLUGIN_DATA_DIR}/bis_application/*
+                fi
+                if [ -n "${BIS_SYSTEM_LOG_FILE}" ]; then
+                    if [ ! -d ${PLUGIN_DATA_DIR}/bis_system ] ; then
+                        mkdir ${PLUGIN_DATA_DIR}/bis_system
+                    fi
+                    log "Collecting bis system logs under plugin_data directory"
+                    for LOG in ${BIS_SYSTEM_LOG_FILE} ; do
+                        cp $LOG ${PLUGIN_DATA_DIR}/bis_system
+                    done
+                    $_CHMOD 644 ${PLUGIN_DATA_DIR}/bis_system/*
+                fi
+            fi
+            umount -l ${BIS_MOUNT_PATH} > /dev/null
+        fi
+    fi
+}
+
+collectNetanServerLogs() {
+    log "Executing netanserver logs collection"
+    REQUIRED_DATE=`echo ${SQL_DATE_ONLY} | sed 's/-//g'`
+    NETAN_MOUNT_PATH=/eniq/netanserver
+    WINDOWS_SERVER_TYPE=netanserver
+    NETAN_FILE=`ls -lrt /eniq/installation/config/windows_server_conf_files | grep "NETAN" | tr -s ' ' | cut -d ' ' -f9`
+    NETAN_IP_ADDRESS=`echo $NETAN_FILE | awk -F "-" '{print $2}'`
+    if [ -n "${NETAN_IP_ADDRESS}" ]; then
+        NETAN_DATA_MOUNTED=`getWindowsDataMountedValue $NETAN_IP_ADDRESS $NETAN_MOUNT_PATH $WINDOWS_SERVER_TYPE`
+        if [ ${NETAN_DATA_MOUNTED} -eq 1 ] ; then
+            NETANSERVER_APPLICATION_LOG_FILE=$(find /eniq/netanserver/ApplicationLogs/ -name "*${REQUIRED_DATE}.txt")
+            NETANSERVER_SYSTEM_LOG_FILE=$(find /eniq/netanserver/SystemLogs/ -name "*_${REQUIRED_DATE}.tsv" && find /eniq/netanserver/SystemLogs/ -name "hostname.tsv")
+            NETANSERVER_FEATURE_LOG_FILE=$(find /eniq/netanserver/FeatureLogs/ -name "*${REQUIRED_DATE}.log")
+            if [ -n "${NETANSERVER_APPLICATION_LOG_FILE}" ] || [ -n "${NETANSERVER_SYSTEM_LOG_FILE}" ] || [ -n "${NETANSERVER_FEATURE_LOG_FILE}" ]; then
+                if [ -n "${NETANSERVER_APPLICATION_LOG_FILE}" ]; then
+                    if [ ! -d ${PLUGIN_DATA_DIR}/netanserver_applications ] ; then
+                        mkdir ${PLUGIN_DATA_DIR}/netanserver_applications
+                    fi
+                    log "Collecting netanserver application logs under plugin_data directory"
+                    for LOG in ${NETANSERVER_APPLICATION_LOG_FILE} ; do
+                        cp $LOG ${PLUGIN_DATA_DIR}/netanserver_applications
+                    done
+                    $_CHMOD 644 ${PLUGIN_DATA_DIR}/netanserver_applications/*
+                fi
+                if [ -n "${NETANSERVER_SYSTEM_LOG_FILE}" ]; then
+                    if [ ! -d ${PLUGIN_DATA_DIR}/netanserver_systems ] ; then
+                        mkdir ${PLUGIN_DATA_DIR}/netanserver_systems
+                    fi
+                    log "Collecting netanserver system logs under plugin_data directory"
+                    for LOG in ${NETANSERVER_SYSTEM_LOG_FILE} ; do
+                        cp $LOG ${PLUGIN_DATA_DIR}/netanserver_systems
+                    done
+                    $_CHMOD 644 ${PLUGIN_DATA_DIR}/netanserver_systems/*
+                fi
+                if [ -n "${NETANSERVER_FEATURE_LOG_FILE}" ]; then
+                    if [ ! -d ${PLUGIN_DATA_DIR}/netanserver_features ] ; then
+                        mkdir ${PLUGIN_DATA_DIR}/netanserver_features
+                    fi
+                    log "Collecting netanserver PM feature logs under plugin_data directory"
+                    for LOG in ${NETANSERVER_FEATURE_LOG_FILE} ; do
+                        cp $LOG ${PLUGIN_DATA_DIR}/netanserver_features
+                    done
+                    $_CHMOD 644 ${PLUGIN_DATA_DIR}/netanserver_features/*
+                fi
+            fi
+            umount -l ${NETAN_MOUNT_PATH} > /dev/null
+        fi
+    fi
+}
+
+collectOCSWithoutCitrixLogs() {
+    log "Executing OCS-Without-Citrix logs collection"
+    REQUIRED_DATE=`echo ${SQL_DATE_ONLY} | sed 's/-//g'`
+    OCS_WITHOUT_CITRIX_MOUNT_PATH=/eniq/OCS-WITHOUT-CITRIX
+    WINDOWS_SERVER_TYPE=OCS-Without-Citrix
+    OCS_WITHOUT_CITRIX_FILE=`ls -lrt /eniq/installation/config/windows_server_conf_files | grep "OCS-WITHOUT-CITRIX" | tr -s ' ' | cut -d ' ' -f9`
+    OCS_WITHOUT_CITRIX_IP_ADDRESS=`echo $OCS_WITHOUT_CITRIX_FILE | awk -F "-" '{print $4}'`
+    if [ -n "${OCS_WITHOUT_CITRIX_IP_ADDRESS}" ]; then
+        OCS_WITHOUT_CITRIX_IP_ADDRESS_DATA_MOUNTED=`getWindowsDataMountedValue $OCS_WITHOUT_CITRIX_IP_ADDRESS $OCS_WITHOUT_CITRIX_MOUNT_PATH $WINDOWS_SERVER_TYPE`
+        if [[ ${OCS_WITHOUT_CITRIX_IP_ADDRESS_DATA_MOUNTED} -eq 1 ]] ; then
+            OCS_WITHOUT_CITRIX_SYSTEM_LOG_FILE=$(find /eniq/OCS-WITHOUT-CITRIX/system_logs/ -name "*_${REQUIRED_DATE}.tsv" && find /eniq/OCS-WITHOUT-CITRIX/system_logs/  -name "hostname.tsv")
+            if [ -n "${OCS_WITHOUT_CITRIX_SYSTEM_LOG_FILE}" ]; then
+                if [ ! -d ${PLUGIN_DATA_DIR}/ocs_without_citrix_system ] ; then
+                    mkdir ${PLUGIN_DATA_DIR}/ocs_without_citrix_system
+                fi
+                log "Collecting ocs_without_citrix system logs under plugin_data directory"
+                for LOG in ${OCS_WITHOUT_CITRIX_SYSTEM_LOG_FILE} ; do
+                    cp $LOG ${PLUGIN_DATA_DIR}/ocs_without_citrix_system
+                done
+                $_CHMOD 644 ${PLUGIN_DATA_DIR}/ocs_without_citrix_system/*
+            fi
+            umount -l ${OCS_WITHOUT_CITRIX_MOUNT_PATH} > /dev/null
+        fi
+    fi
+}
+
+collectSimLogs() {
+    log "Executing Sim Logs collection"
+    SIM_LOG_FILE=$(find /eniq/log/sw_log/sim -name "sim.log*")
+    if [ -n "${SIM_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/sim ] ; then
+            mkdir ${PLUGIN_DATA_DIR}/sim
+        fi
+        log "Collecting Sim Logs under plugin_data directory"
+        for LOG in ${SIM_LOG_FILE} ; do
+            cp $LOG ${PLUGIN_DATA_DIR}/sim
+            if [ $? -eq 0 ] ; then
+                log "Sim Log $LOG collected successfully under /plugin_data/sim directory."
+            fi
+        done
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/sim/*
+    else
+        log "Sim log files sim.log* are not available under /eniq/log/sw_log/sim directory."
+    fi
+}
+
+
+coredumpDetailsCollection() {
+    OUTPUT_COREDUMP_DIR="/tmp"
+    LOG_FILE="/eniq/log/assureddc/ERICddc-ENIQ.log"
+    DATE=`date '+%Y-%m-%d'`
+    HOSTNAME=`hostname`
+
+    ###########################################################################
+    # Functions
+    ###########################################################################
+
+    # This function will log to the assureddc plugin log (ERICddc-ENIQ.log.YYYY-mm-dd)
+    logMsg() {
+        date_hms=`date '+%Y-%m-%d %H:%M:%S'`
+        ${ECHO} "${date_hms} ${HOSTNAME} ${0}:${1}" >> "${LOG_FILE}.$DATE"
+    }
+
+    #This function will process the file pattern of core file pattern directory and log the coredump information in a text file.
+    coredumpsDetailsCollection() {
+        replace_alpha_numeric="[0-9a-zA-Z]*"
+        replace_numeric="[0-9]*"
+        replace_for_all=".*"
+        if [[ "$core_file_pattern_file" =~ "%n" ]]; then
+            core_file_pattern_file=${core_file_pattern_file//%n/$HOSTNAME}
+        fi
+        if [[ "$core_file_pattern_file" =~ "%h" ]]; then
+            core_file_pattern_file=${core_file_pattern_file//%h/$HOSTNAME}
+        fi
+        if [[ "$core_file_pattern_file" =~ "%f" ]]; then
+            core_file_pattern_file=${core_file_pattern_file//%f/$replace_for_all}
+        fi
+        if [[ "$core_file_pattern_file" =~ "%e" ]]; then
+            core_file_pattern_file=${core_file_pattern_file//%e/$replace_for_all}
+        fi
+        if [[ "$core_file_pattern_file" =~ "%s" ]]; then
+            core_file_pattern_file=${core_file_pattern_file//%s/$replace_numeric}
+        fi
+        if [[ "$core_file_pattern_file" =~ "%p" ]]; then
+            core_file_pattern_file=${core_file_pattern_file//%p/$replace_numeric}
+        fi
+        if [[ "$core_file_pattern_file" =~ "%u" ]]; then
+            core_file_pattern_file=${core_file_pattern_file//%u/$replace_numeric}
+        fi
+        if [[ "$core_file_pattern_file" =~ "%g" ]]; then
+            core_file_pattern_file=${core_file_pattern_file//%g/$replace_numeric}
+        fi
+        if [[ "$core_file_pattern_file" =~ "%m" ]]; then
+            core_file_pattern_file=${core_file_pattern_file//%m/$replace_alpha_numeric}
+        fi
+        if [[ "$core_file_pattern_file" =~ "%t" ]]; then
+            core_file_pattern_file=${core_file_pattern_file//%t/$replace_for_all}
+        fi
+        coredump_file_list=`${LS} -lrt --time-style=long-iso ${core_file_pattern_dir} | ${EGREP} ${core_file_pattern_file}$ | ${TR} -s ' '`
+        if [ ! -z "${coredump_file_list}" ]; then
+            IFS=$'\n'
+            for file in $coredump_file_list
+            do
+                coredump_file_path=`${ECHO} $file | ${CUT} -d ' ' -f8`
+                coredump_file_name=${coredump_file_path##*/}
+                coredump_file_size=`${ECHO} $file | ${CUT} -d ' ' -f5`
+                coredump_date_year=`${ECHO} $file | ${CUT} -d ' ' -f6`
+                coredump_time=`${ECHO} $file | ${CUT} -d ' ' -f7`
+                coredump_creation_time=$coredump_date_year" "$coredump_time
+                coredump_collection_time=`date "+%F %T"`
+                ${ECHO} "$1" "$2" "$coredump_collection_time" "$coredump_creation_time" "$coredump_file_name" "$coredump_file_size" >> "${OUTPUT_COREDUMP_DIR}/coredump_details_$DATE.txt"
+            done
+        fi
+    }
+
+    ###########################################################################
+    # Main
+    ###########################################################################
+
+    logMsg "INFO: Processing coredump log files..."
+    # Cleans up all the old coredump log files.
+    ${FIND} ${OUTPUT_COREDUMP_DIR} -name "coredump*" | ${GREP} -v ${DATE} | xargs ${RM} -f > /dev/null 2>&1;
+    if [ ${?} -ne 0 ]; then
+        logMsg "INFO: No coredump log found in the ${OUTPUT_COREDUMP_DIR} directory."
+    fi
+
+    core_file_pattern=`${CAT} "/proc/sys/kernel/core_pattern"`
+    if [[ ${core_file_pattern:0:1} =~ \/ ]]; then
+        core_file_pattern_dir=${core_file_pattern%/*}
+        core_file_pattern_file=${core_file_pattern##*/}
+        file_system_name=`df -h ${core_file_pattern_dir} | ${TAIL} -1 | ${AWK} -F' ' '{print $1}'`
+        file_system_size=`df -h ${core_file_pattern_dir} | ${TAIL} -1 | ${AWK} -F' ' '{print $2}'`
+        server_type=`${CAT} /eniq/installation/config/installed_server_type`
+        path_type="local"
+        if [ "${file_system_name:0:3}" == "nas" ]; then
+            path_type="shared"
+        fi
+        coredumpsDetailsCollection $HOSTNAME $server_type
+        ${ECHO} "$HOSTNAME" "$server_type" "$core_file_pattern_dir" "$file_system_size" "$path_type" > "${OUTPUT_COREDUMP_DIR}/coredump_path_$DATE.txt"
+
+        logMsg "collecting coredump path and coredump details log files under plugin_data directory"
+        COREDUMP_LOG_FILES=$(find ${OUTPUT_COREDUMP_DIR} -name "coredump_*.txt")
+        if [ -n "${COREDUMP_LOG_FILES}" ]; then
+            if [ ! -d ${PLUGIN_DATA_DIR}/coredump_details ] ; then
+                mkdir ${PLUGIN_DATA_DIR}/coredump_details
+            fi
+            for LOG in ${COREDUMP_LOG_FILES} ; do
+                cp $LOG ${PLUGIN_DATA_DIR}/coredump_details
+            done
+            $_CHMOD 644 ${PLUGIN_DATA_DIR}/coredump_details/*
+        fi
+    else
+        logMsg "INFO: The pattern set against 'kernel.core_pattern' in file /proc/sys/kernel/core_pattern is ${core_file_pattern}. Pattern does not contain any specific directory path, therefore DDC cannot collect the coredump details. Stopping the script execution..."
+        return 0
+    fi
+}
+
+collectOMBSBackupLog() {
+    log "Executing OMBS Backup log collection"
+    OMBS_BACKUP_LOG_FILE=$(find /eniq/local_logs/backup_logs -name "prep_eniq_backup.log")
+    if [ -n "${OMBS_BACKUP_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/OMBS_Backup ] ; then
+            mkdir ${PLUGIN_DATA_DIR}/OMBS_Backup
+        fi
+        log "Collecting OMBS Backup log under plugin_data directory"
+        cp ${OMBS_BACKUP_LOG_FILE} ${PLUGIN_DATA_DIR}/OMBS_Backup
+        if [ $? -eq 0 ] ; then
+            log "${OMBS_BACKUP_LOG_FILE} log file collected successfully under /plugin_data/OMBS_Backup directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/OMBS_Backup/prep_eniq_backup.log
+    else
+        log "OMBS Backup log file prep_eniq_backup.log is not available under /eniq/local_logs/backup_logs directory."
+    fi
+}
+
+collectRollingSnapshotLog() {
+    log "Executing Rolling Snapshot log collection"
+    ROLLING_SNAPSHOT_LOG_FILE=$(find /eniq/local_logs/rolling_snapshot_logs -name "prep_roll_snap.log")
+    if [ -n "${ROLLING_SNAPSHOT_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/Rolling_Snapshot ] ; then
+            mkdir ${PLUGIN_DATA_DIR}/Rolling_Snapshot
+        fi
+        log "Collecting Rolling Snapshot log under plugin_data directory"
+        cp ${ROLLING_SNAPSHOT_LOG_FILE} ${PLUGIN_DATA_DIR}/Rolling_Snapshot
+        if [ $? -eq 0 ] ; then
+            log "${ROLLING_SNAPSHOT_LOG_FILE} log file collected successfully under /plugin_data/Rolling_Snapshot directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/Rolling_Snapshot/prep_roll_snap.log
+    else
+        log "Rolling Snapshot log file prep_roll_snap.log is not available under /eniq/local_logs/rolling_snapshot_logs directory."
+    fi
+}
+
+collectBacklogMonitoringLogs() {
+    log "Executing backlog monitoring log collection"
+    UNDERSCORE_DATE=$(echo ${SQL_DATE_ONLY} | sed 's/-/_/g')
+    BACKLOG_LOG_FILE=$(ls /eniq/log/sw_log/engine/engine-${UNDERSCORE_DATE}.log)
+    if [ -n  "${BACKLOG_LOG_FILE}" ] ; then
+        log "Collecting backlog monitoring log under plugin_data directory"
+        if [ ! -d ${PLUGIN_DATA_DIR}/backlog_monitoring ] ; then
+            mkdir ${PLUGIN_DATA_DIR}/backlog_monitoring
+        fi
+        cp  ${BACKLOG_LOG_FILE} ${PLUGIN_DATA_DIR}/backlog_monitoring
+        if [ $? -eq 0 ] ; then
+            log "${BACKLOG_LOG_FILE} log file collected successfully under /plugin_data/backlog_monitoring directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/backlog_monitoring/*
+    else
+        log "Backlog Monitoring log file engine-${UNDERSCORE_DATE}.log is not available under /eniq/log/sw_log/engine/ directory."
+    fi
+}
+
+sybaseiqInstrMetricCollector() {
+
+    ###########################################################################
+    # This script will collect catalogue cache values and number of connections
+    # for sybase IQ 16 from coordinator and all the reader servers.
+    ###########################################################################
+
+    ############################################################################
+    # Global Variables
+    ############################################################################
+    output_log_location="/tmp"
+    log_file="/eniq/log/assureddc/ERICddc-ENIQ.log"
+    access_log_location="/eniq/log/sw_log/glassfish/access"
+    file_pattern="sybaseIQ_instr"
+    eniq_conf_dir="/eniq/installation/config"
+    tmp_file="/tmp/db_cmnd_output.txt";
+    DBISQL="/eniq/sybase_iq/IQ-16_0/bin64/dbisql"
+    date=$(date +%Y-%m-%d)
+    CONF_DIR="/eniq/sw/conf"
+    iq_file="/eniq/local_logs/iq"
+    command_to_write="select PropName, Value from sa_eng_properties() where Propname='CacheFree';
+    OUTPUT TO '/tmp/db_cmnd_output.txt' APPEND FORMAT ASCII DELIMITED BY ';' QUOTE '';
+    SELECT DB_PROPERTY ( 'PageSize' );
+    OUTPUT TO '/tmp/db_cmnd_output.txt' APPEND FORMAT ASCII DELIMITED BY ';' QUOTE '';
+    select userid, count(*) from  sp_iqconnection() where Userid != ' ' GROUP BY Userid;
+    OUTPUT TO '/tmp/db_cmnd_output.txt' APPEND FORMAT ASCII DELIMITED BY ';' QUOTE '';"
+
+    ############################################################################
+    # Subroutine  : manage_log_file
+    # Description : Cleans up log older than 1 day.
+    # Arguments   : msg
+    # Returns     : N/A
+    ############################################################################
+    manage_log_file() {
+       ${FIND} ${output_log_location} -name "*sybaseIQ_instr*" | $GREP -v $date | xargs ${RM} -f;
+       file_pattern_current_date="${file_pattern}_${date}.txt"
+    }
+
+    ############################################################################
+    # Subroutine  : create_commandfile
+    # Description : Creates command file neeeded for feeding into dbisql commands
+    # Arguments   : msg
+    # Returns     : N/A
+    ############################################################################
+    create_commandfile() {
+        ${ECHO} $command_to_write > $output_log_location/command_file.sql
+    }
+
+    ############################################################################
+    # Subroutine  : calculate_cache_values
+    # Description : database commands for fetching different catalogue cache
+    #               parameters from coordinator and reader servers.
+    # Arguments   : server name, port number, hostname, cache_allocated
+    # Returns     : N/A
+    ############################################################################
+    calculate_cache_values() {
+        current_date=`/usr/bin/date +%b%t%d%t%T%t%Y | $SED -e "s/[[:space:]]\+/ /g"`
+        port=$2
+        if [ $port == "2640" ]; then
+            ${SU} - dcuser -c "dbisql -nogui -c \"eng=$1;links=tcpip{host=$3;port=$2};uid=dba;pwd=$DBA_PW\" \"$output_log_location/command_file.sql\"" >> /dev/null 2>&1
+        else
+            ${SU} - dcuser -c "dbisql -nogui -c \"con=dba;eng=$1;links=tcpip{host=$3;port=$2;verify=no};uid=dba;pwd=$DBA_PW\" \"$output_log_location/command_file.sql\"" >> /dev/null 2>&1
+        fi
+        count=0
+        ${CAT} $tmp_file | while read LINE
+        do
+            if [ $count -eq 0 ]; then
+                ${ECHO} "$current_date $3 $1 $LINE" >> /tmp/test.txt
+                ${ECHO} "CacheAllocated;$4" >> /tmp/test.txt
+            elif [ $count -eq 1 ]; then
+                ${ECHO} "PageSize;$LINE" >> /tmp/test.txt
+            elif [ $count -gt 1 ]; then
+                ${ECHO} "User; $LINE" >> /tmp/test.txt
+            else
+                ${ECHO} $LINE >> /tmp/test.txt
+            fi
+            count=$((count+1))
+        done
+        ${ECHO} $(${CAT} /tmp/test.txt) >> ${output_log_location}/$file_pattern_current_date
+        ${RM} -rf /tmp/test.txt
+        ${RM} -rf /$tmp_file
+    }
+
+    ############################################################################
+    # Subroutine  : calculate_cache_allocated
+    # Description : calculating the cache_allocated value
+    # Arguments   : N/A
+    # Returns     : value of cache allocated
+    ############################################################################
+    calculate_cache_allocated(){
+        std_err_file=`${LS} -ltr ${iq_file}/*.stderr | ${TAIL} -1`
+        std_err_filename="${std_err_file##*/}"
+        std_err_array=(`${GREP} "User Parameters" ${iq_file}/$std_err_filename`)
+        if [ "${std_err_array[6]}" == "'-ch'" ]; then
+            cache_allocated_value="${std_err_array[7]}"
+        else
+            cache_allocated_value="${std_err_array[5]}"
+        fi
+        cache_allocated_filtered="${cache_allocated_value//\'/}"
+        $ECHO  "${cache_allocated_filtered//[!0-9]}"
+    }
+
+    ############################################################################
+    # Subroutine  : log_msg
+    # Description : Logs to ERICddc-ENIQ.log
+    # Arguments   : String to written to the log
+    # Returns     : N/A
+    ############################################################################
+    log_msg() {
+        temp_date=`date '+%Y-%m-%d %H:%M:%S'`
+        ${ECHO} "${temp_date} ${0} ${1}" >> "${log_file}.${date}"
+    }
+
+    collectSybaseIqLog() {
+        log_msg "Executing Sybase IQ log collection"
+        Sybase_IQ_LOG_FILE=$(find /tmp -name "sybaseIQ_instr_${SQL_DATE_ONLY}.txt")
+        if [ -n "${Sybase_IQ_LOG_FILE}" ]; then
+            if [ ! -d ${PLUGIN_DATA_DIR}/sybase_iq ] ; then
+                mkdir ${PLUGIN_DATA_DIR}/sybase_iq
+            fi
+            log_msg "Collecting Sybase IQ log under plugin_data directory"
+            cp ${Sybase_IQ_LOG_FILE} ${PLUGIN_DATA_DIR}/sybase_iq
+            $_CHMOD 644 ${PLUGIN_DATA_DIR}/sybase_iq/*
+        fi
+    }
+
+    ###########################################################################
+    # Main
+    ###########################################################################
+
+    # Checking if somehow /tmp/db_cmnd_output.txt file is not deleted and deleting this.
+    if [ -s $tmp_file ]; then
+        log_msg "INFO: Deleting the file for Sybase IQ if somehow it is not deleted."
+        ${RM} -rf $tmp_file
+    fi
+
+    log_msg "INFO: Collection of Sybase IQ 16 catalogue cache logs..."
+
+    create_commandfile
+
+    manage_log_file
+
+    DBA_PW=`getIqPassword DBA`
+    CURR_SERVER_TYPE=`$CAT ${eniq_conf_dir}/installed_server_type | $GREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+    if [ "${CURR_SERVER_TYPE}" == "eniq_events" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+        dwh_server_name="dwhdb"
+        dwh_host_name=$(${CAT} /etc/hosts | $GREP $dwh_server_name | $SED -e 's/\s\+/ /g' | $CUT -d ' ' -f 2)
+        cache_allocated=`calculate_cache_allocated`
+        port_number=2640
+        calculate_cache_values $dwh_server_name $port_number $dwh_host_name $cache_allocated
+    else
+        if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" ]; then
+            port_number=2640
+            dwh_host_name=`hostname`
+            dwh_server_name="dwhdb"
+            cache_allocated=`calculate_cache_allocated`
+            calculate_cache_values $dwh_server_name $port_number $dwh_host_name $cache_allocated
+        elif [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+            port_number=2642
+            dwh_host_name=`hostname`
+            server_name=(`${CAT} /etc/hosts | ${GREP} $dwh_host_name | ${GREP} "dwh_reader"`)
+            dwh_server_name="${server_name[2]}"
+            cache_allocated=`calculate_cache_allocated`
+            calculate_cache_values $dwh_server_name $port_number $dwh_host_name $cache_allocated
+        else
+            return 1
+        fi
+    fi
+
+    collectSybaseIqLog
+
+}
+
+collectSapIqLargeMemoryLogs() {
+
+    ############################################################################
+    # Global Variables
+    ############################################################################
+    output_log_location="/eniq/log/assureddc"
+    file_pattern="sapiq_large_memory"
+    eniq_conf_dir="/eniq/installation/config"
+    tmp_file="/tmp/sapiq_db_output.txt";
+    date=$(/usr/bin/date +%Y-%m-%d)
+    command_to_write="select Name,Value from sp_iqstatus() where Name like '%IQ large memory%';
+    OUTPUT TO '${tmp_file}' APPEND FORMAT ASCII DELIMITED BY '' QUOTE ''"
+
+    ############################################################################
+    # Subroutine  : create_queryfile
+    # Description : Creates a query file, needed to fire/execute the query in DB.
+    # Arguments   : N/A
+    # Returns     : N/A
+    ############################################################################
+    create_queryfile() {
+        if [ ! -s $output_log_location/sapIqLargeMemory/sapiq_query_file.sql ]; then
+            log_msg "INFO: Creating a file containing a query required for fetching SAP IQ large memory information."
+            ${ECHO} $command_to_write > $output_log_location/sapIqLargeMemory/sapiq_query_file.sql
+        fi
+    }
+
+    ############################################################################
+    # Subroutine  : manage_log_file
+    # Description : Cleans up all the old SAP IQ large memory log files.
+    # Arguments   : msg
+    # Returns     : N/A
+    ############################################################################
+    manage_log_file() {
+        log_msg "INFO: Removing the old files of SAP IQ large memory log."
+        ${FIND} $output_log_location -name "*sapiq_large_memory*" | ${GREP} -v "${date}" | xargs ${RM} -f;
+        file_pattern_current_date="${file_pattern}_${date}.txt"
+    }
+
+
+    ############################################################################
+    # Subroutine  : get_db_details
+    # Description : This function will get the server list and database
+    #             : names from /etc/hosts file.
+    # Arguments   : server name, port number, procedure name, metric name
+    # Returns     : Metric values corresponding to metricname
+    ############################################################################
+    get_db_details() {
+        DBA_PW=`getIqPassword DBA`
+        CURR_SERVER_TYPE=`$CAT ${eniq_conf_dir}/installed_server_type | $GREP -v '^[[:blank:]]*#' | $SED -e 's/ //g'`
+        if [ "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+            dwh_server_name="dwhdb"
+            dwh_host_name=$($GREP $dwh_server_name /etc/hosts | $CUT -d ' ' -f 3)
+            port_number=2640
+            prepare_sapiq_large_memory_logfile $dwh_server_name $port_number $dwh_host_name
+        else
+            dwh_server_name=$($GREP dwh /etc/hosts | $CUT -d ' ' -f 5)
+            array=(${dwh_server_name// / })
+            for server_name in ${array[@]}; do
+                dwh_host_name=$($GREP $server_name /etc/hosts | $CUT -d ' ' -f 3)
+                if [ $server_name == "dwhdb" ]; then
+                    port_number=2640
+                else
+                    port_number=2642
+                fi
+                prepare_sapiq_large_memory_logfile $server_name $port_number $dwh_host_name
+            done
+        fi
+    }
+
+    ############################################################################
+    # Subroutine  : prepare_sapiq_large_memory_logfile
+    # Description : Fetches the sapiq large memory information and stores the data in sapiq_large_memory_yyyy-mm-dd.txt log.
+    # Arguments   : N/A
+    # Returns     : N/A
+    ############################################################################
+
+    prepare_sapiq_large_memory_logfile() {
+        current_time=$(/usr/bin/date | $AWK '{print $4}')
+        log_msg "INFO: Connecting to DWHDB to fetch SAP IQ large memory details."
+        _conn_str_user_dba_="-c \"eng=$1;links=tcpip{host=$3;port=$2};uid=dba;pwd=$DBA_PW\""
+        rm -rf /var/tmp/conn_str_encrypt.txt.*
+        _conn_str_user_dba_enc=/var/tmp/conn_str_encrypt.txt.$$
+        get_encrypted_file "${_conn_str_user_dba_}" "${_conn_str_user_dba_enc}"
+        ${SU} - dcuser -c "dbisql -nogui @${_conn_str_user_dba_enc} \"$output_log_location/sapIqLargeMemory/sapiq_query_file.sql\"" > /dev/null 2>&1
+        ${CAT} $tmp_file | ${TR} '\n' ',' > /tmp/sapiq_large_test.txt
+        ${ECHO} "$date $current_time $3 $1" $(${CAT} /tmp/sapiq_large_test.txt) >> $output_log_location/sapIqLargeMemory/$file_pattern_current_date
+        log_msg "INFO: Removing the $tmp_file file."
+        ${RM} -rf $tmp_file
+        ${RM} -rf /tmp/sapiq_large_test.txt
+    }
+
+    ############################################################################
+    # Subroutine  : collect_sapiq_large_memory_logfile
+    # Description : collects the sapiq large memory log file under plugin_data directory.
+    # Arguments   : N/A
+    # Returns     : N/A
+    ############################################################################
+    collect_sapiq_large_memory_logfile() {
+        log_msg "collecting sapiq large memory log under plugin_data directory"
+        SAPIQ_LARGE_MEMORY_LOG_FILE=$(find ${output_log_location}/sapIqLargeMemory -name "sapiq_large_memory_*.txt")
+        if [ -n "${SAPIQ_LARGE_MEMORY_LOG_FILE}" ]; then
+            if [ ! -d ${PLUGIN_DATA_DIR}/sapIqLargeMemory ] ; then
+                mkdir ${PLUGIN_DATA_DIR}/sapIqLargeMemory
+            fi
+            cp ${SAPIQ_LARGE_MEMORY_LOG_FILE} ${PLUGIN_DATA_DIR}/sapIqLargeMemory/
+            $_CHMOD 644 ${PLUGIN_DATA_DIR}/sapIqLargeMemory/*
+        fi
+    }
+
+    ############################################################################
+    # Subroutine  : log_msg
+    # Description : Logs to ERICddc-ENIQ.log
+    # Arguments   : String to be written to the log
+    # Returns     : N/A
+    ############################################################################
+    log_msg() {
+        logging_timestamp=`/usr/bin/date '+%Y-%m-%d %H:%M:%S'`
+        log_file="${output_log_location}/ERICddc-ENIQ.log"
+        ${ECHO} "${logging_timestamp} ${0} ${1}" >> "${log_file}.${date}"
+    }
+
+    ###########################################################################
+    # Main
+    ###########################################################################
+
+    # Checking if somehow /tmp/sapiq_db_output.txt file is not deleted and deleting this.
+    if [ -s $tmp_file ]; then
+        log_msg "INFO: Deleting the file for SAP IQ large memory if somehow it is not deleted."
+        ${RM} -rf $tmp_file
+    fi
+
+    log_msg "Collecting DDC data for SAP IQ Large Memory Utilization."
+    if [ ! -d "${output_log_location}/sapIqLargeMemory" ]; then
+        ${MKDIR} -p ${output_log_location}/sapIqLargeMemory
+        if [ ${?} -ne 0 ]; then
+            log_msg "ERROR: Unable to create the output log directory ${output_log_location}/sapIqLargeMemory. Stopping script execution.."
+            return 1
+        fi
+    fi
+
+    create_queryfile
+
+    manage_log_file
+
+    get_db_details
+
+    collect_sapiq_large_memory_logfile
+}
+
+collectServiceRestartLog() {
+    log_msg "Executing Eniq Service Restart log collection"
+    SERVICE_RESTART_LOG_FILE=$(find /tmp -name "eniqServiceRestart-${SQL_DATE_ONLY}.txt")
+    if [ -n "${SERVICE_RESTART_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/eniqServiceRestart ] ; then
+            mkdir ${PLUGIN_DATA_DIR}/eniqServiceRestart
+        fi
+        log_msg "Collecting Eniq Service Restart log under plugin_data directory"
+        cp ${SERVICE_RESTART_LOG_FILE} ${PLUGIN_DATA_DIR}/eniqServiceRestart
+        if [ $? -eq 0 ] ; then
+            log "${SERVICE_RESTART_LOG_FILE} log file collected successfully under /plugin_data/eniqServiceRestart directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/eniqServiceRestart/*
+    else
+        log "Eniq Service Restart log file eniqServiceRestart-${SQL_DATE_ONLY}.txt is not available under /tmp directory."
+    fi
+}
+
+osMemoryProfileCollection() {
+
+    ###########################################################################
+    # This script will capture the OS memory profile on all the blades of
+    # a server.
+    ###########################################################################
+
+    ############################################################################
+    # Global Variables
+    ############################################################################
+    DATE="/usr/bin/date"
+    output_log_location="/tmp"
+    log_file="/eniq/log/assureddc/ERICddc-ENIQ.log"
+    file_pattern="os_rhel_memory_profile"
+    date=$(${DATE} +"%Y-%m-%d")
+    hostname=`/usr/bin/hostname`
+
+    ###########################################################################
+    # Subroutines
+    ###########################################################################
+
+    #This function clears the log older than 1 day.
+    manage_log_file() {
+       log_msg "INFO: Removing the old files of os_memory_profile log."
+        ${FIND} ${output_log_location} -name "*${file_pattern}*" | ${GREP} -v "${date}" | xargs ${RM} -f;
+        file_pattern_current_date="${file_pattern}_${date}.txt"
+    }
+
+    #This function collects os memory profile details on each blade.
+    get_os_memory_profile() {
+        log_msg "INFO : Collecting os memory profile details."
+        logging_timestamp=$(${DATE} +"%Y-%m-%d %H:%M:%S")
+        ${ECHO} "Logging timestamp is : ${logging_timestamp}" >> ${output_log_location}/$file_pattern_current_date
+        ${CAT} /proc/meminfo >> ${output_log_location}/$file_pattern_current_date
+        ${ECHO} "" >> ${output_log_location}/$file_pattern_current_date
+    }
+
+    # This function logs to ERICddc-ENIQ.log.YYYY-MM-DD
+    log_msg() {
+        logging_timestamp=`/usr/bin/date '+%Y-%m-%d %H:%M:%S'`
+        ${ECHO} "${logging_timestamp} ${0} ${1}" >> "${log_file}.${date}"
+    }
+
+    collect_os_memory_profile_log() {
+        log_msg "Executing Os Memory Profile log collection"
+        Os_Memory_Profile_Log_File=$(find /tmp -name "${file_pattern}_${SQL_DATE_ONLY}.txt")
+        if [ -n "${Os_Memory_Profile_Log_File}" ]; then
+            if [ ! -d ${PLUGIN_DATA_DIR}/osMemoryProfile ] ; then
+                mkdir ${PLUGIN_DATA_DIR}/osMemoryProfile
+            fi
+            log_msg "Collecting Os Memory Profile log under plugin_data directory"
+            cp ${Os_Memory_Profile_Log_File} ${PLUGIN_DATA_DIR}/osMemoryProfile
+            $_CHMOD 644 ${PLUGIN_DATA_DIR}/osMemoryProfile/*
+        fi
+    }
+
+    ###########################################################################
+    # Main
+    ###########################################################################
+
+    manage_log_file
+
+    get_os_memory_profile
+
+    collect_os_memory_profile_log
+
+}
+
+upgradeTimeCalculation() {
+    log "Executing upgrade timing logs collection"
+
+    ############################################################################
+    # Global Variables
+    ############################################################################
+    output_log_location="/eniq/log/assureddc"
+    date=$(date +%Y-%m-%d)
+    file_pattern="upgrade_timing_detail_log.txt"
+    feature_name_list="features_name_list_log.txt"
+    missing_upgrade_logs="missing_upgrade_logs.txt"
+    upgrade_server_info="upgrade_server_type_info.txt"
+    upgrade_date_time=""
+    upgrade_time_yyyymmddHHMMSS=""
+    server_type=`$CAT /eniq/installation/config/installed_server_type`
+
+    ############################################################################
+    #  Description : Logs to ERICddc-ENIQ.log
+    ############################################################################
+    log_msg() {
+        logging_timestamp=`date '+%Y-%m-%d %H:%M:%S'`
+        hostname=`hostname`
+        log_file="/eniq/log/assureddc/ERICddc-ENIQ.log.$(date +%Y-%m-%d)"
+        $ECHO "$logging_timestamp $hostname ${0} ${1}" >> "${log_file}"
+    }
+
+    ############################################################################
+    # Description : Cleans up the existing files of upgrade timings logs.
+    ############################################################################
+    manageLogFile() {
+        log_msg "INFO: Removing the old files of Upgrade timing logs."
+        $RM -f $output_log_location/upgrade_time/*.txt ;
+    }
+
+    ###################################################################################
+    # Description: This function verifies if any successful upgrade has been performed.
+    ###################################################################################
+    checkUpgrade() {
+        eniq_history_file=/eniq/admin/version/eniq_history
+        installation_date_count=`$GREP "INST_DATE" $eniq_history_file 2> /dev/null| $WC -l`
+        if [ $installation_date_count -gt 1 ]; then
+            current_upgrade_date=`$GREP "INST_DATE" $eniq_history_file | $TAIL -1 | $AWK -F' ' '{print $2}' | $SED 's/_/-/g;s/\./-/g'`
+            upgrade_date_time=`convertDateString $current_upgrade_date`
+            log_msg "INFO: Successful upgrade has been performed on the server on $current_upgrade_date."
+        else
+            log_msg "INFO: No upgrade has been performed on the server."
+            return 0
+        fi
+    }
+
+    ################################################################################
+    # Description: This function verifies type of upgrade performed on the
+    # ENIQ Events server (Full Upgrade or Feature Only Upgrade).
+    ################################################################################
+    checkUpgradeType() {
+        upgrade_log_file=/eniq/log/sw_log/platform_installer/platform_management_log/upgrade_platform_modules.log
+        if [ -s  $upgrade_log_file ]; then
+            mediation_start_time_upgrade_log=`$GREP "Start pre-provisioning of Mediation Gateway TechPacks" $upgrade_log_file | $TAIL -1 | $AWK -F' ' '{print $1}'| $SED 's/\./-/g;s/_/-/g;s/://g'`
+        fi
+        manage_log_file=/eniq/log/feature_management_log/manage_features.log
+        if [ -s $manage_log_file ]; then
+            mediation_start_time_manage_feature=`$GREP "Start pre-provisioning of Mediation Gateway TechPacks" $manage_log_file | $TAIL -1 | $AWK -F' ' '{print $1}'| $SED 's/\./-/g;s/_/-/g;s/://g'`
+        fi
+        mediation_gateway_starttime_upgrade_log=`convertDateString $mediation_start_time_upgrade_log`
+        mediation_gateway_starttime_manage_feature=`convertDateString $mediation_start_time_manage_feature`
+        return_value=`dateComparision "${mediation_gateway_starttime_upgrade_log}" "${mediation_gateway_starttime_manage_feature}"`
+        if [ "$return_value" == 0 ] ; then
+            logfile="/eniq/log/feature_management_log/manage_features.log"
+            if [ -z $mediation_start_time_upgrade_log ]; then
+                upgradeType="Full Upgrade Without FDM"
+                $ECHO "Upgrade_Server $upgradeType" >> $output_log_location/upgrade_time/$upgrade_server_info
+            else
+               upgradeType="Feature only"
+               $ECHO "Upgrade_Server $upgradeType" >> $output_log_location/upgrade_time/$upgrade_server_info
+            fi
+        else
+           logfile="/eniq/log/sw_log/platform_installer/platform_management_log/upgrade_platform_modules.log"
+           upgradeType="FDM Full Upgrade"
+           $ECHO "Upgrade_Server $upgradeType" >> $output_log_location/upgrade_time/$upgrade_server_info
+        fi
+    }
+
+    ########################################################################################################
+    # Description: This function calculates the time difference between two stages of ENIQ Upgrade.
+    ########################################################################################################
+    dateComparision() {
+        previous_stage_starttime=$1
+        current_stage_starttime=$2
+        return_value=1
+        if [ -z $previous_stage_starttime ]; then
+            previous_date=0
+        else
+            previous_date=`$ECHO $previous_stage_starttime | $SED 's/-//g'`
+        fi
+        current_date=`$ECHO $current_stage_starttime | $SED 's/-//g'`
+        if [ $previous_date -lt $current_date ] ; then
+            return_value=0
+        fi
+        $ECHO $return_value
+    }
+
+    ###############################################################################
+    # Description: Converts date String into Integer.
+    ###############################################################################
+    convertDateString() {
+        date_time_string=$1
+        if [ -z $date_time_string ]; then
+            date_time_string=0
+            $ECHO $date_time_string
+        else
+            month=`${ECHO} $date_time_string | $AWK -F'-' '{print $2 }'`
+            case "$month" in
+                Jan) mon=01 ;;
+                Feb) mon=02 ;;
+                Mar) mon=03 ;;
+                Apr) mon=04 ;;
+                May) mon=05 ;;
+                Jun) mon=06 ;;
+                Jul) mon=07 ;;
+                Aug) mon=08 ;;
+                Sep) mon=09 ;;
+                Oct) mon=10 ;;
+                Nov) mon=11 ;;
+                Dec) mon=12 ;;
+            esac
+            date_yyyymmdd_HHMMSS=`${ECHO} $date_time_string | $SED s/$month/$mon/g`
+            $ECHO $date_yyyymmdd_HHMMSS
+        fi
+    }
+
+    ##################################################################################################################
+    # Description: This function calculates the time details of RHEL Live Upgrade in ENIQ Upgrade.
+    ##################################################################################################################
+    calculateTimeLiveUpgrade() {
+        previous_upgrade_date=`$GREP "INST_DATE" /eniq/admin/version/eniq_history | $TAIL -2 | $HEAD -1 | $AWK -F' ' '{print $2}' | $SED 's/_/-/g;s/\./-/g'`
+        previous_upgrade_date_time=`convertDateString $previous_upgrade_date`
+        previous_upgrade_time_yyyymmddHHMMSS=`$ECHO $previous_upgrade_date_time | $SED 's/-//g'`
+        upgrade_time_yyyymmddHHMMSS=`$ECHO $upgrade_date_time | $SED 's/-//g'`
+        live_upgrade_start_time=`$GREP "Start of liveupgrade.bsh" /var/log/ericsson/SLU/live_upgrade_*.log /dev/null  2>/dev/null | $TAIL -1 | $AWK -F' ' '{print $2}'| $SED 's/://g'`
+        live_upgrade_endtime=`$GREP "End of liveupgrade.bsh" /var/log/ericsson/SLU/live_upgrade_*.log /dev/null 2>/dev/null | $TAIL -1 | $AWK -F' ' '{print $2}' | $SED 's/://g'`
+        if [[ -z $live_upgrade_endtime ]]; then
+            live_upgrade_endtime=`$GREP ' ----< END' /var/log/ericsson/SLU/live_upgrade_*.log /dev/null 2>/dev/null | $TAIL -1 | $AWK -F' ' '{print $2}' | $SED 's/://g'`
+        fi
+        live_upgrade_time_yyyymmddHHMMSS=`$ECHO $live_upgrade_start_time | $SED 's/-//g'`
+        if [[ $live_upgrade_time_yyyymmddHHMMSS -lt $upgrade_time_yyyymmddHHMMSS ]] && [[ $live_upgrade_time_yyyymmddHHMMSS -gt $previous_upgrade_time_yyyymmddHHMMSS ]]; then
+            $ECHO "Rhel_Live_Upgrade Live_Upgrade $live_upgrade_start_time $live_upgrade_endtime" >> $output_log_location/upgrade_time/$file_pattern
+        else
+            $ECHO "Rhel_Live_Upgrade Live_Upgrade No logging found in associated log of this stage" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+            log_msg "INFO: No logging found in associated log of Live_Upgrade stage."
+        fi
+    }
+
+    #############################################################################################################
+    # Description: This function calculates the time details of Create Snapshots in ENIQ Upgrade
+    #############################################################################################################
+    calculateTimePrepEniqSnap() {
+        log_file="/eniq/log/sw_log/rolling_snapshot_logs/prep_eniq_snapshots.log"
+        if [ -s $log_file ]; then
+            eniq_snapshot_starttime=`$GREP "Prepare eniq snapshots started" $log_file | $TAIL -1 | $AWK -F' ' '{print $1}' | $SED 's/\./-/g;s/_/-/g'`
+            eniq_snapshot_endtime=`$EGREP "Prepare ENIQ snapshots finished sucessfully|successfully" $log_file | $TAIL -1 | $AWK -F' ' '{print $1}' | $SED 's/\./-/g;s/_/-/g'`
+            if [ "$upgradeType" == "Feature only" ]; then
+                $ECHO "Create_Snapshots Create_Snapshot_Coordinator $eniq_snapshot_starttime $eniq_snapshot_endtime" >> $output_log_location/upgrade_time/$file_pattern
+            else
+                return_value=`dateComparision "${eniq_snapshot_starttime}" "${upgrade_date_time}" `
+                if [ "$return_value" == 0 ] ; then
+                    $ECHO "Create_Snapshots Create_Snapshot_Coordinator $eniq_snapshot_starttime $eniq_snapshot_endtime" >> $output_log_location/upgrade_time/$file_pattern
+                else
+                    eniq_snapshot_starttime=`$GREP "Prepare eniq snapshots started" /eniq/log/sw_log/rolling_snapshot_logs/prep_eniq_snapshots.log | $TAIL -2 | $HEAD -1 | $AWK -F' ' '{print $1}' | $SED 's/\./-/g;s/_/-/g'`
+                    $ECHO "Create_Snapshots Create_Snapshot_Coordinator Last logging found in associated log of this stage does not belong to last upgrade" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                fi
+            fi
+        else
+            $ECHO "Create_Snapshots Create_Snapshot_Coordinator Required log file does not exist" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+            log_msg "INFO: No log file found for Create_Snapshots_Coordinator stage."
+        fi
+    }
+
+    ##############################################################################################################
+    # Description: This function calculates the time details of SAP ASA Upgrade in ENIQ Upgrade
+    ##############################################################################################################
+    calculateTimeUpgradeSapAsa() {
+        log_file="/eniq/log/sybase_asa/upgrade_sybase_asa.log"
+        if [ -s $log_file ]; then
+            sap_asa_starttime=`$GREP "Starting Sybase ASA upgrade" $log_file | $TAIL -1 | $AWK -F' ' '{print $2}' | $SED 's/\./-/g;s/_/-/g'`
+            sap_asa_endtime=`$GREP "Successfully executed upgrade_sybase_sql_anywhere.bsh" $log_file | $TAIL -1 | $AWK -F' ' '{print $1}' | $SED 's/\./-/g;s/_/-/g'`
+            return_value=`dateComparision "${sap_asa_starttime}" "${upgrade_date_time}"`
+            if [ "$return_value" == 0 ] ; then
+                $ECHO "SAP_ASA_And_IQ_Upgrade SAP_ASA_Upgrade $sap_asa_starttime $sap_asa_endtime" >> $output_log_location/upgrade_time/$file_pattern
+            else
+                $ECHO "SAP_ASA_and_IQ_Upgrade SAP_ASA_Upgrade No logging found in associated log of this stage" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                log_msg "INFO: No logging found in associated log of SAP_ASA_Upgrade stage."
+            fi
+        else
+            $ECHO "SAP_ASA_and_IQ_Upgrade SAP_ASA_Upgrade Required log file does not exist" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+            log_msg "INFO: No log file found for SAP_ASA_Upgrade stage."
+        fi
+        if [ -z $sap_asa_starttime ]; then
+            sap_asa_starttime=$eniq_snapshot_starttime
+        fi
+    }
+
+    ##########################################################################################################
+    # Description: This function calculates the time details of SAP IQ upgrade in ENIQ Upgrade
+    ##########################################################################################################
+    calculateTimeUpgradeSapIQ() {
+        log_file="/eniq/log/sybase_iq/upgrade_sybaseiq.log"
+        if [ -s $log_file ]; then
+            sap_iq_starttime=`$GREP "Starting Sybase upgrade" $log_file | $TAIL -1 | $AWK -F' ' '{print $2}' | $SED 's/\./-/g;s/_/-/g'`
+            sap_iq_endtime=`$GREP "Finishing /eniq/admin/bin/transaction_log_admin.bsh" $log_file | $TAIL -1 | $AWK -F' ' '{print $2}' | $SED 's/\./-/g;s/_/-/g'`
+            return_value=`dateComparision "${sap_asa_starttime}" "${sap_iq_starttime}"`
+            if [ "$return_value" == 0 ] ; then
+                $ECHO "SAP_ASA_And_IQ_Upgrade SAP_IQ_Upgrade $sap_iq_starttime $sap_iq_endtime" >> $output_log_location/upgrade_time/$file_pattern
+            else
+                $ECHO "SAP_ASA_and_IQ_Upgrade SAP_IQ_Upgrade No logging found in associated log of this stage" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                log_msg "INFO: No logging found in associated log of SAP_IQ_Upgrade stage."
+            fi
+        else
+            $ECHO "SAP_ASA_And_IQ_Upgrade SAP_IQ_Upgrade Required log file does not exist" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+            log_msg "INFO: No log file found for SAP_IQ_Upgrade stage."
+        fi
+        if [ -z $sap_iq_starttime ]; then
+            sap_iq_starttime=$sap_asa_starttime
+        fi
+    }
+
+    ################################################################################################################################
+    # Description: This function calculates the time details of Mediation Gateway Workflow Auto-provisioning in ENIQ Stats Upgrade
+    #################################################################################################################################
+    calculateTimeMedGwAutoProvisioning() {
+        if [ "$upgradeType" == "FDM Full Upgrade" ]; then
+            upgrade_stage="ENIQ_Platform_Upgrade"
+        else
+            upgrade_stage="ENIQ_Stats_Features_Upgrade"
+        fi
+        if [ -s $1 ]; then
+            mediation_start_time=`$GREP "Start pre-provisioning of Mediation Gateway TechPacks" $1 | $TAIL -1 | $AWK -F' ' '{print $1}'| $SED 's/\./-/g;s/_/-/g;s/://g'`
+            mediation_gateway_starttime=`convertDateString $mediation_start_time`
+            mediation_end_time=`$GREP "End pre-provisioning of Mediation Gateway TechPacks" $1 | $TAIL -1 | $AWK -F' ' '{print $1}'| $SED 's/\./-/g;s/_/-/g;s/://g'`
+            mediation_gateway_endtime=`convertDateString $mediation_end_time`
+            if [ "$upgradeType" == "Feature only" ]; then
+                return_value=`dateComparision "${feature_upgrade_starttime}" "${mediation_gateway_starttime}"`
+                if [ "$return_value" == 0 ] ; then
+                    $ECHO "ENIQ_Stats_Features_Upgrade Feature_Provisioning_Steps_(applicable_for_feature_only_upgrade) $mediation_gateway_starttime $mediation_gateway_endtime" >> $output_log_location/upgrade_time/$file_pattern
+                else
+                    $ECHO "ENIQ_Stats_Features_Upgrade Feature_Provisioning_Steps_(applicable_for_feature_only_upgrade) No logging found in associated log of this stage" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                fi
+            else
+                if [ "$upgradeType" == "Full Upgrade Without FDM"  ]; then
+                    return_value=`dateComparision "${feature_upgrade_starttime}" "${mediation_gateway_starttime}"`
+                else
+                    return_value=`dateComparision "${sap_iq_starttime}" "${mediation_gateway_starttime}"`
+                fi
+                if [ "$return_value" == 0 ] ; then
+                    $ECHO "$upgrade_stage Mediation_Gateway_Workflow_Auto-Provisioning $mediation_gateway_starttime $mediation_gateway_endtime" >> $output_log_location/upgrade_time/$file_pattern
+                else
+                    $ECHO "$upgrade_stage Mediation_Gateway_Workflow_Auto-Provisioning No logging found in associated log of this stage" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                    log_msg "INFO: No logging found in associated log of Mediation_Gateway_Workflow_Auto-Provisioning stage."
+                fi
+            fi
+        else
+            $ECHO "$upgrade_stage Mediation_Gateway_Workflow_Auto-Provisioning Required log file does not exist" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+            log_msg "INFO: No log file found for Mediation_Gateway_Workflow_Auto-Provisioning stage."
+        fi
+        if [ -z $mediation_gateway_starttime ]; then
+            if [ "$upgradeType" == "Full Upgrade Without FDM"  ]; then
+                mediation_gateway_starttime=$feature_upgrade_starttime
+            fi
+            if [ "$upgradeType" == "FDM Full Upgrade"  ]; then
+                mediation_gateway_starttime=$sap_iq_starttime
+            fi
+        fi
+    }
+
+    ###############################################################################################################
+    # Description: This function calculates the time details of ENIQ Platform Upgrade in ENIQ Upgrade
+    ###############################################################################################################
+    calculateTimeInstallEniqPlatform() {
+        if [ $server_type == "eniq_stats" -o $server_type == "stats_coordinator" ]; then
+            log_file="/eniq/log/sw_log/platform_installer/platform_management_log/upgrade_platform_modules.log"
+            if [ -s $log_file ]; then
+                start_eniq_upgrade_time=`$GREP "Starting to execute upgrade_platform_modules.bsh" $log_file | $TAIL -1 | $AWK -F' ' '{print $2}' | $SED 's/\./-/g;s/_/-/g'`
+                eniq_platform_starttime=`convertDateString $start_eniq_upgrade_time`
+                end_eniq_upgrade_time=`$GREP "Successfully completed upgrade_platform_modules.bsh" $log_file | $TAIL -1 | $AWK -F' ' '{print $2}' | $SED 's/\./-/g;s/_/-/g'`
+                eniq_platform_endtime=`convertDateString $end_eniq_upgrade_time`
+                return_value=`dateComparision "${sap_iq_starttime}" "${eniq_platform_starttime}"`
+                if [ "$return_value" == 0 ] ; then
+                    $ECHO "ENIQ_Stats_Features_Upgrade ENIQ_Platform_Upgrade $eniq_platform_starttime $eniq_platform_endtime" >> $output_log_location/upgrade_time/$file_pattern
+                else
+                    $ECHO "ENIQ_Stats_Features_Upgrade ENIQ_Platform_Upgrade No logging found in associated log of this stage" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                    log_msg "INFO: No logging found in associated log of ENIQ_Platform_Upgrade stage."
+                fi
+            else
+                $ECHO "ENIQ_Stats_Features_Upgrade ENIQ_Platform_Upgrade Required log file does not exist" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                log_msg "INFO: No log file found for ENIQ_Platform_Upgrade stage."
+            fi
+        else
+            if [ "$upgradeType" == "Full Upgrade Without FDM"  ]; then
+                upgrade_stage="ENIQ_Stats_Features_Upgrade"
+            else
+                upgrade_stage="ENIQ_Platform_Upgrade"
+            fi
+            if [ -s $1 ]; then
+                start_eniq_upgrade_time=`$GREP "Entering core install stage . install_ENIQ_platform" $1 | $TAIL -1 | $AWK -F' ' '{print $1}' | $SED 's/\./-/g;s/_/-/g'`
+                eniq_platform_starttime=`convertDateString $start_eniq_upgrade_time`
+                end_eniq_upgrade_time=`$GREP "Successfully installed ENIQ Platform" $1 | $TAIL -1 | $AWK -F' ' '{print $1}' | $SED 's/\./-/g;s/_/-/g'`
+                eniq_platform_endtime=`convertDateString $end_eniq_upgrade_time`
+                return_value=`dateComparision "${mediation_gateway_starttime}" "${eniq_platform_starttime}"`
+                if [ "$return_value" == 0 ] ; then
+                    $ECHO "$upgrade_stage ENIQ_Platform_Upgrade $eniq_platform_starttime $eniq_platform_endtime" >> $output_log_location/upgrade_time/$file_pattern
+                else
+                    $ECHO "$upgrade_stage ENIQ_Platform_Upgrade No logging found in associated log of this stage" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                    log_msg "INFO: No logging found in associated log of ENIQ_Platform_Upgrade stage."
+                fi
+            else
+                $ECHO "$upgrade_stage ENIQ_Platform_Upgrade Required log file does not exist" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                log_msg "INFO: No log file found for ENIQ_Platform_Upgrade stage."
+            fi
+            if [ -z $eniq_platform_starttime ]; then
+                eniq_platform_starttime=$mediation_gateway_starttime
+            fi
+        fi
+    }
+
+    ##########################################################################################################
+    # Description: This function calculates the time details of Feature Upgrade of ENIQ Upgrade
+    ##########################################################################################################
+    calculateTimeFeaturesUpgrade() {
+        log_file="/eniq/log/feature_management_log/manage_features.log"
+        if [ -s $log_file ]; then
+            feature_upgrade_starttime=`$GREP "Starting feature upgrade" $log_file | $TAIL -1 | $AWK -F' ' '{print $1}'| $SED 's/\./-/g;s/_/-/g'`
+            feature_upgrade_endtime=`$GREP "Feature upgrade completed" $log_file | $TAIL -1 | $AWK -F' ' '{print $1}'|$SED 's/\./-/g;s/_/-/g'`
+            if [ "$upgradeType" == "Feature only" ]; then
+                return_value=`dateComparision "${eniq_snapshot_starttime}" "${feature_upgrade_starttime}"`
+                if [ "$return_value" == 0 ] ; then
+                    $ECHO "ENIQ_Stats_Features_Upgrade Features_Upgrade $feature_upgrade_starttime $feature_upgrade_endtime" >> $output_log_location/upgrade_time/$file_pattern
+                else
+                    $ECHO "ENIQ_Stats_Features_Upgrade Features_Upgrade No logging found in associated log of this stage" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                    log_msg "INFO: No logging found in associated log of Features_Upgrade stage."
+                fi
+            else
+                if [ "$upgradeType" == "Full Upgrade Without FDM"  ]; then
+                    return_value=`dateComparision "${sap_iq_starttime}" "${feature_upgrade_starttime}"`
+                else
+                    return_value=`dateComparision "${eniq_platform_starttime}" "${feature_upgrade_starttime}"`
+                fi
+                if [ "$return_value" == 0 ] ; then
+                    $ECHO "ENIQ_Stats_Features_Upgrade Features_Upgrade $feature_upgrade_starttime $feature_upgrade_endtime" >> $output_log_location/upgrade_time/$file_pattern
+                else
+                    $ECHO "ENIQ_Stats_Features_Upgrade Features_Upgrade No logging found in associated log of this stage" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                    log_msg "INFO: No logging found in associated log of Features_Upgrade stage."
+                fi
+            fi
+        else
+            $ECHO "ENIQ_Stats_Features_Upgrade Features_Upgrade Required log file does not exist" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+            log_msg "INFO: No log file found for Features_Upgrade stage."
+        fi
+        if [ -z $feature_upgrade_starttime ]; then
+            if [ "$upgradeType" == "Full Upgrade Without FDM"  ]; then
+                feature_upgrade_starttime=$sap_iq_starttime
+            fi
+            if [ "$upgradeType" == "FDM Full Upgrade"  ]; then
+                feature_upgrade_starttime=$eniq_platform_starttime
+            fi
+
+        fi
+    }
+
+    #########################################################################################################
+    # Description: This function calculates the time details of Opengeo Upgrade in ENIQ Stats Upgrade
+    #########################################################################################################
+    calculateTimeUpgradeOpengeo() {
+        log_file="/eniq/log/feature_management_log/upgrade_opengeo.log"
+        if [ -s $log_file ]; then
+            opengeo_starttime=`$GREP "Starting executing script upgrade_opengeo.bsh" $log_file | $TAIL -1 | $AWK -F' ' '{print $2}' | $SED 's/\./-/g;s/_/-/g'`
+            opengeo_endtime=`$GREP "upgrade_opengeo.bsh has been executed successfully" $log_file | $TAIL -1 | $AWK -F' ' '{print $2}' | $SED 's/\./-/g;s/_/-/g'`
+            return_value=`dateComparision "${eniq_platform_starttime}" "${opengeo_starttime}"`
+            if [ "$return_value" == 0 ] ; then
+                $ECHO "ENIQ_Stats_Features_Upgrade Opengeo_Upgrade $opengeo_starttime $opengeo_endtime" >> $output_log_location/upgrade_time/$file_pattern
+            else
+                $ECHO "ENIQ_Stats_Features_Upgrade Opengeo_Upgrade No logging found in associated log of this stage" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                log_msg "INFO: No logging found in associated log of Opengeo_upgrade stage."
+            fi
+        else
+            $ECHO "ENIQ_Stats_Features_Upgrade Opengeo_Upgrade Required log file does not exist" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+            log_msg "INFO: No log file found for Opengeo_Upgrade stage."
+        fi
+    }
+
+    #########################################################################################
+    # Description: This function collects the name-list of features upgraded in ENIQ Upgrade
+    #########################################################################################
+    featuresNameList() {
+        log_file="/eniq/log/feature_management_log/manage_features.log"
+        if [ -s $log_file ]; then
+            $GREP "Upgrade type will be" $log_file | $TAIL -1 | $AWK '{ print "Upgrade type will be", $5}' >> $output_log_location/upgrade_time/$feature_name_list
+            line_num=`$GREP -n "The following features will be updated" $log_file | $TAIL -1 | $CUT -d: -f1`
+            start_line=`$EXPR $line_num + 1`
+            end_line=`$GREP -n "Stopping all ENIQ services" $log_file | $TAIL -1 | $CUT -d: -f1`
+            $SED -n "$start_line,$end_line p" $log_file >> $output_log_location/upgrade_time/$feature_name_list
+        else
+            log_msg "INFO: Required log file is not found for Features Upgrade stage.."
+        fi
+    }
+
+    ############################################################################
+    #  Description : Call the functions required for ENIQ Events & ENIQ Stats
+    ############################################################################
+    upgradeTimeCheck () {
+        log_msg "INFO: Installed server type is $server_type. Starting to collect upgrade time information."
+        manageLogFile
+        checkUpgrade
+        featuresNameList
+        if [ $server_type == "eniq_stats" -o $server_type == "stats_coordinator" ]; then
+            calculateTimeLiveUpgrade
+            calculateTimePrepEniqSnap
+            calculateTimeUpgradeSapAsa
+            calculateTimeUpgradeSapIQ
+            calculateTimeFeaturesUpgrade
+            calculateTimeInstallEniqPlatform
+        else
+            checkUpgradeType
+            if [ "$upgradeType" == "Feature only"  ]; then
+                $ECHO "Rhel_Live_Upgrade Live_Upgrade This stage is not applicable in feature only upgrade" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                calculateTimePrepEniqSnap
+                $ECHO "SAP_ASA_and_IQ_Upgrade SAP_ASA_Upgrade This stage is not applicable in feature only upgrade" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                $ECHO "SAP_ASA_and_IQ_Upgrade SAP_IQ_Upgrade This stage is not applicable in feature only upgrade" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                calculateTimeFeaturesUpgrade
+                calculateTimeMedGwAutoProvisioning $logfile
+                $ECHO "ENIQ_Platform_Upgrade ENIQ_Platform_Upgrade This stage is not applicable in feature only upgrade" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+                $ECHO "ENIQ_Stats_Features_Upgrade Opengeo_Upgrade This stage is not applicable in feature only upgrade" >> $output_log_location/upgrade_time/$missing_upgrade_logs
+
+            else
+                calculateTimeLiveUpgrade
+                calculateTimePrepEniqSnap
+                calculateTimeUpgradeSapAsa
+                calculateTimeUpgradeSapIQ
+                if [ "$upgradeType" == "Full Upgrade Without FDM"  ]; then
+                    calculateTimeFeaturesUpgrade
+                    calculateTimeMedGwAutoProvisioning $logfile
+                    calculateTimeInstallEniqPlatform $logfile
+                else
+                    calculateTimeMedGwAutoProvisioning $logfile
+                    calculateTimeInstallEniqPlatform $logfile
+                    calculateTimeFeaturesUpgrade
+                fi
+                calculateTimeUpgradeOpengeo
+            fi
+        fi
+
+        UPGRADE_TIMING_LOG_FILE=$(find ${output_log_location}/upgrade_time -name "*.txt")
+        if [ -n "${UPGRADE_TIMING_LOG_FILE}" ]; then
+            if [ ! -d ${PLUGIN_DATA_DIR}/upgrade_time ] ; then
+                mkdir ${PLUGIN_DATA_DIR}/upgrade_time
+            fi
+            log_msg "Collecting upgrade timing log under plugin_data directory"
+            for LOG in ${UPGRADE_TIMING_LOG_FILE} ; do
+                cp $LOG ${PLUGIN_DATA_DIR}/upgrade_time
+            done
+            $_CHMOD 644 ${PLUGIN_DATA_DIR}/upgrade_time/*
+        fi
+    }
+
+    ###########################################################################
+    # Main
+    ###########################################################################
+    log_msg "INFO: Collecting time details of upgrade stages of ENIQ upgrade."
+
+    if [ ! -d "${output_log_location}/upgrade_time" ]; then
+        log_msg "INFO: Creating log directory ${output_log_location}/upgrade_time"
+        ${MKDIR} -p ${output_log_location}/upgrade_time
+        if [ ${?} -ne 0 ]; then
+            log_msg "ERROR: Unable to create the output log dir.. Stopping script execution.."
+            return 1
+        fi
+    fi
+
+    upgradeTimeCheck
+}
+
+collectSybaseIqVersionLog() {
+    log "Executing Sybase IQ Version log collection"
+    Sybase_IQ_VERSION_LOG_FILE="/eniq/sybase_iq/version/iq_version"
+    if [ -f "${Sybase_IQ_VERSION_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/sybase_iq ] ; then
+            mkdir ${PLUGIN_DATA_DIR}/sybase_iq
+        fi
+        log "Collecting Sybase IQ version log file under plugin_data directory"
+        cp ${Sybase_IQ_VERSION_LOG_FILE} ${PLUGIN_DATA_DIR}/sybase_iq
+        if [ $? -eq 0 ] ; then
+            log "${Sybase_IQ_VERSION_LOG_FILE} log file collected successfully under /plugin_data/sybase_iq directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/sybase_iq/*
+    else
+        log "Sybase IQ Version log file iq_version is not available under /eniq/sybase_iq/version directory."
+    fi
+}
+
+collectJmxXml() {
+    log "Collecting General JMX xml file for ENIQ"
+    JMX_XML_FILE="/opt/ericsson/ERICddc/monitor/appl/ENIQ/sim.xml"
+    if [ -f "${JMX_XML_FILE}" ]; then
+        cp ${JMX_XML_FILE} ${DATAROOT}/${DATE}/instr/
+    fi
+}
+
+collectSAN() {
+    log "Collecting SAN configuration details for Unity"
+    if [ ! -r ${OUTPUT_DIR}/ENIQ/san.cfg ] ; then
+        SAN_TYPE=`$_TAIL -1 /eniq/installation/config/san_details | $_AWK -F "=" '{print $2}'`
+        if [ -r ${ERIC_STORAGE_ETC_DIR}/.ddc.conf ] ; then
+            IP=`$_GREP "sp" ${ERIC_STORAGE_ETC_DIR}/unity.conf | $_AWK -F "=>" '{print $2}' | $_SED "s/[' ,]//g"`
+            USER=`$_GREP "user" ${ERIC_STORAGE_ETC_DIR}/unity.conf | $_AWK -F "=>" '{print $2}' | $_SED "s/[' ,]//g"`
+            PASSWORD="python ${ERIC_STORAGE_LIB_DIR}/encryptdecrypt.py --decrypt"
+        fi
+        $_ECHO ${SAN_TYPE} | $_GREP --silent -i unity
+        if [ $? -eq 0 ] ; then
+            if [ ! -d ${DATAROOT}/${DATE}/unity ] ; then
+                $_MKDIR ${DATAROOT}/${DATE}/unity
+            fi
+            $_CAT > ${DATAROOT}/${DATE}/unity/san.cfg <<EOF
+IP=${IP}
+USER=${USER}
+GET_PASSWORD=${PASSWORD}
+EOF
+        fi
+    fi
+}
+
+calculate_days_difference() {
+    local start_date=$1
+    local end_date=$2
+    local start_seconds=$(date -d "$start_date" +%s)
+    local end_seconds=$(date -d "$end_date" +%s)
+    local seconds_diff=$((end_seconds - start_seconds))
+    ${ECHO} $((seconds_diff / 86400))
+}
+
+collectUnityCertificateDetails() {
+    INPUT_FILE="/var/tmp/unityCertificateExpiry.txt"
+    OUTPUT_FILE_LOCATION="${DATAROOT}/${DATE}/unity"
+    $_TOUCH ${OUTPUT_FILE_LOCATION}/unityCertificateExpiryDetails.txt
+    OUTPUT_FILE_NAME="${DATAROOT}/${DATE}/unity/unityCertificateExpiryDetails.txt"
+
+    if [[ $(whoami) == "root" ]]; then
+        export HOME="/root"
+    else
+        export HOME="/home/"$(whoami)
+    fi
+
+    if [ -s ${DATAROOT}/${DATE}/unity/san.cfg ]; then
+        log "Collecting Unity/UnityXT certificate expiry details"
+        IP=`$_GREP "sp" ${ERIC_STORAGE_ETC_DIR}/unity.conf | $_AWK -F "=>" '{print $2}' | $_SED "s/[' ,]//g"`
+        USER=`$_GREP "user" ${ERIC_STORAGE_ETC_DIR}/unity.conf | $_AWK -F "=>" '{print $2}' | $_SED "s/[' ,]//g"`
+        PASSWD=`python /ericsson/storage/san/plugins/unity/lib/encryptdecrypt.py --decrypt`
+
+        uemcli -d "$IP" /sys/general show -filter "System name" | $_GREP -i  'System Name' | $_AWK -F "=" '{print $2}' | $_SED "s/[ ]//g" > $OUTPUT_FILE_LOCATION/hostname.txt
+
+        uemcli -d "$IP" -u "$USER" -p "$PASSWD" /sys/cert show >  /var/tmp/unityCertificateExpiry.txt
+        if [ $? -eq 0 ] ; then
+            log "Fetching Unity/UnityXT certificate details under /var/tmp directory"
+        else
+            log "Unable to Fetch Unity/UnityXT certificate details under /var/tmp directory"
+        fi
+    fi
+
+
+
+    if [ -s $INPUT_FILE ]; then
+        log "Collecting Unity Certificate Expiry Details log file under unity directory"
+
+        # Read input string from file
+        input_string=$(<"$INPUT_FILE")
+
+        # Extracting relevant fields
+        certificate_name=$(echo "$input_string" | grep -oP 'Certificate ID = \K\S+')
+        expiry_date=$(echo "$input_string" | grep -oP 'Valid to\s+= \K\S+')
+        expiry_date_converted=$(date -d "$expiry_date" "+%d/%m/%Y")
+        deployment="UNITY"
+        purpose=`$CAT /eniq/installation/config/san_details | $GREP "^SAN_DEVICE=" | $AWK -F\= '{print $2}'`
+        current_date=$(date "+%Y-%m-%d")
+        expiry_days=$(calculate_days_difference "$current_date" "$expiry_date")
+
+        # Formatting output
+        printf "Deployment::Certificate Alias::Purpose::Certificate Expiry Date::Certificate Expiry (in days)\n" > "$OUTPUT_FILE_NAME"
+        printf "%s::%s::%s::%s::%s\n" "$deployment" "$certificate_name" "$purpose" "$expiry_date_converted" "$expiry_days" >> "$OUTPUT_FILE_NAME"
+        $_CHMOD 644 ${OUTPUT_FILE_NAME}
+    fi
+    log "INFO: Removing the old files of unity certificate from /var/tmp."
+    $_RM -f ${INPUT_FILE}
+}
+
+collectNodeDetails() {
+    log "Collecting Node data."
+    output_log_location="/eniq/log/assureddc"
+    if [ ! -d "${output_log_location}/radioNode" ]; then
+        log "INFO: Creating log directory ${output_log_location}/radioNode"
+        ${MKDIR} -p ${output_log_location}/radioNode
+        if [ ${?} -ne 0 ]; then
+            log "ERROR: Unable to create the output log dir.. Stopping script execution.."
+            return 1
+        fi
+    fi
+    log "INFO: Removing the old files of Node information"
+    ${FIND} ${output_log_location}/radioNode -name "node_name_*_details*" | xargs ${RM} -f;
+    DCPUBLIC_PW=`getIqPassword DCPUBLIC`
+    if [ -z "${DCPUBLIC_PW}" ]  ; then
+        log "Node names log not created as DCPUBLIC_PW is empty"
+        return 0;
+    fi
+    isql -s\; -w999 -b -Udcpublic -P${DCPUBLIC_PW} -Sdwhdb dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${output_log_location}/radioNode/node_name_2g_details_${SQL_DATE_ONLY}.txt
+SELECT DISTINCT NAME, TYPE FROM (
+SELECT DISTINCT BTS_NAME AS NAME, BTS_TYPE AS TYPE
+FROM DCPUBLIC.DIM_E_GRAN_RADIONODE_BTS
+WHERE status like 'ACTIVE'
+UNION ALL
+SELECT DISTINCT BSC_NAME AS NAME, BSC_TYPE AS TYPE
+FROM DCPUBLIC.DIM_E_GRAN_BSC
+WHERE status like 'ACTIVE'
+UNION ALL
+SELECT DISTINCT RADIONODE_NAME AS NAME, RADIONODE_TYPE AS TYPE
+FROM DCPUBLIC.DIM_E_GRAN_RADIONODE
+WHERE status like 'ACTIVE'
+) AS INNER_QUERY
+go
+EOF
+
+    isql -s\; -w999 -b -Udcpublic -P${DCPUBLIC_PW} -Sdwhdb dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${output_log_location}/radioNode/node_name_3g_details_${SQL_DATE_ONLY}.txt
+SELECT DISTINCT NAME, TYPE FROM (
+SELECT DISTINCT RNC_NAME AS NAME, managedElementType AS TYPE
+FROM DCPUBLIC.DIM_E_RAN_RNC
+WHERE status like 'ACTIVE'
+UNION ALL
+SELECT DISTINCT RBS_NAME AS NAME, managedElementType AS TYPE
+FROM DCPUBLIC.DIM_E_RAN_RBS
+WHERE status like 'ACTIVE'
+) AS INNER_QUERY
+go
+EOF
+
+    isql -s\; -w999 -b -Udcpublic -P${DCPUBLIC_PW} -Sdwhdb dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${output_log_location}/radioNode/node_name_4g_details_${SQL_DATE_ONLY}.txt
+SELECT DISTINCT ERBS_NAME, managedElementType
+FROM DCPUBLIC.DIM_E_LTE_ERBS
+WHERE status like 'ACTIVE'
+go
+EOF
+
+    isql -s\; -w999 -b -Udcpublic -P${DCPUBLIC_PW} -Sdwhdb dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${output_log_location}/radioNode/node_name_5g_details_${SQL_DATE_ONLY}.txt
+SELECT DISTINCT NR_NAME, NE_TYPE
+FROM DCPUBLIC.DIM_E_LTE_NR
+WHERE status like 'ACTIVE'
+go
+EOF
+}
+
+inputFileToArray() {
+    FILE_NAME=$1
+    FILE_PATH=$2
+    TECH=$3
+    TYPE=$4
+    FILE="$FILE_PATH/$FILE_NAME"
+    NODE_ARRAY=""
+
+    while IFS=, read -r R_TECH R_NODE_NAME R_NODE_TYPE; do
+        if [[ "$R_TECH" = "$TECH" && "$R_NODE_TYPE" = "$TYPE" ]] ; then
+            NODE_ARRAY+=",'${R_NODE_NAME}'"
+        fi
+    done < $FILE
+    echo ${NODE_ARRAY}  | $CUT -c 2-
+}
+
+collectCellCount() {
+    TECH=$1
+    NODES=$2
+    TYPE=$3
+
+    if [[ "$TECH" = "GSM" && ! -z "$NODES" ]]  ;  then
+        isql -s\; -w999 -b -Udcpublic -P${DCPUBLIC_PW} -Sdwhdb dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${OUTPUT_FILE_LOCATION}/cellCountFiles/radio_cell_${TECH}_${TYPE}_count.txt
+SELECT COALESCE(SUM(Cell_Count),0) AS [Cell Count], COALESCE(SUM(Node_Count),0) AS [Node Count]
+FROM(
+SELECT
+COUNT(DISTINCT CELL_ID) AS Cell_Count,
+COUNT(DISTINCT BSC_NAME) AS Node_Count
+FROM dcpublic.DIM_X_BSS_CELL
+WHERE status like 'ACTIVE'
+AND BSC_NAME in (${NODES})
+Group by OSS_ID, BSC_NAME
+) AS internal_query
+go
+EOF
+    elif [[ "$TECH" = "WCDMA" && ! -z "$NODES" ]]  ;  then
+        if [[ "$TYPE" = "G1" ]]  ;  then
+            isql -s\; -w999 -b -Udcpublic -P${DCPUBLIC_PW} -Sdwhdb dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${OUTPUT_FILE_LOCATION}/cellCountFiles/radio_cell_${TECH}_${TYPE}_count.txt
+SELECT COALESCE(SUM(Cell_Count),0) AS [Cell Count]
+FROM(
+(SELECT SUM(Inner_Cell_Count) AS Cell_Count FROM ( SELECT
+COUNT(DISTINCT RbsLocalCell) AS Inner_Cell_Count
+FROM dcpublic.DC_E_RBS_RBSLOCALCELL_V_RAW
+WHERE ROWSTATUS like 'Loaded'
+AND RBS in (${NODES})
+Group by OSS_ID, RBS) as query1
+UNION
+SELECT SUM(Inner_Cell_Count) AS Cell_Count FROM ( SELECT
+COUNT(DISTINCT RbsLocalCell) AS Inner_Cell_Count
+FROM dcpublic.DC_E_RBS_RBSLOCALCELL_RAW
+WHERE ROWSTATUS like 'Loaded'
+AND RBS in (${NODES})
+Group by OSS_ID, RBS) as query2)
+UNION ALL
+(SELECT SUM(Inner_Cell_Count) AS Cell_Count FROM ( SELECT
+COUNT(DISTINCT EDchResourcesCell) AS Inner_Cell_Count
+FROM dcpublic.DC_E_RBS_EDCHRESOURCESCELL_RAW
+WHERE ROWSTATUS like 'Loaded'
+AND RBS in (${NODES})
+Group by OSS_ID, RBS) as query3
+UNION
+SELECT SUM(Inner_Cell_Count) AS Cell_Count FROM ( SELECT
+COUNT(DISTINCT EDchResourcesCell) AS Inner_Cell_Count
+FROM dcpublic.DC_E_RBS_EDCHRESOURCESCELL_V_RAW
+WHERE ROWSTATUS like 'Loaded'
+AND RBS in (${NODES})
+Group by OSS_ID, RBS) as query4)
+UNION ALL
+(SELECT SUM(Inner_Cell_Count) AS Cell_Count FROM ( SELECT
+COUNT(DISTINCT RadioLinksCell) AS Inner_Cell_Count
+FROM dcpublic.DC_E_RBS_RADIOLINKSCELL_RAW
+WHERE ROWSTATUS like 'Loaded'
+AND RBS in (${NODES})
+Group by OSS_ID, RBS) as query5
+UNION
+SELECT SUM(Inner_Cell_Count) AS Cell_Count FROM ( SELECT
+COUNT(DISTINCT RadioLinksCell) AS Inner_Cell_Count
+FROM dcpublic.DC_E_RBS_RADIOLINKSCELL_V_RAW
+WHERE ROWSTATUS like 'Loaded'
+AND RBS in (${NODES})
+Group by OSS_ID, RBS) as query6)
+) AS internal_query
+go
+EOF
+        elif [[ "$TYPE" = "RNC" ]]  ;  then
+            isql -s\; -w999 -b -Udcpublic -P${DCPUBLIC_PW} -Sdwhdb dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${OUTPUT_FILE_LOCATION}/cellCountFiles/radio_cell_${TECH}_${TYPE}_count.txt
+SELECT COALESCE(SUM(Cell_Count),0) AS [Cell Count]
+FROM(
+SELECT
+COUNT(DISTINCT CELL_ID) AS Cell_Count
+FROM dcpublic.DIM_RAN_CELL
+WHERE status like 'ACTIVE'
+AND RNC_NAME in (${NODES})
+Group by OSS_ID, RNC_NAME
+) AS internal_query
+go
+EOF
+        elif [[ "$TYPE" = "PICO" ]] ;  then
+            isql -s\; -w999 -b -Udcpublic -P${DCPUBLIC_PW} -Sdwhdb dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${OUTPUT_FILE_LOCATION}/cellCountFiles/radio_cell_${TECH}_${TYPE}_count.txt
+SELECT COALESCE(SUM(Cell_count),0) as [Cell Count], COALESCE(SUM(Node_Count),0) AS [Node Count]
+FROM (
+SELECT
+COUNT(DISTINCT RBSLOCALCELL_ID) AS Cell_count,
+COUNT(DISTINCT RBS_ID) AS Node_Count
+FROM dcpublic.DIM_E_RAN_RBSLOCALCELL
+WHERE status like 'ACTIVE'
+AND RBS_ID IN (${NODES})
+Group by OSS_ID, RBS_ID
+) AS internal_query
+go
+EOF
+        else
+            isql -s\; -w999 -b -Udcpublic -P${DCPUBLIC_PW} -Sdwhdb dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${OUTPUT_FILE_LOCATION}/cellCountFiles/radio_cell_${TECH}_${TYPE}_count.txt
+SELECT COALESCE(SUM(Cell_Count),0) AS [Cell Count]
+FROM(
+(SELECT SUM(Inner_Cell_Count) AS Cell_Count FROM ( SELECT
+COUNT(DISTINCT EDchResourcesCell) AS Inner_Cell_Count
+FROM dcpublic.DC_E_RBSG2_EDCHRESOURCESCELL_RAW
+WHERE ROWSTATUS like 'Loaded'
+AND RBS in (${NODES})
+Group by OSS_ID, RBS) as query1
+UNION
+SELECT SUM(Inner_Cell_Count) AS Cell_Count FROM ( SELECT
+COUNT(DISTINCT EDchResourcesCell) AS Inner_Cell_Count
+FROM dcpublic.DC_E_RBSG2_EDCHRESOURCESCELL_V_RAW
+WHERE ROWSTATUS like 'Loaded'
+AND RBS in (${NODES})
+Group by OSS_ID, RBS) as query2)
+UNION ALL
+(SELECT SUM(Inner_Cell_Count) AS Cell_Count FROM ( SELECT
+COUNT(DISTINCT NodeBLocalCellGroup) AS Inner_Cell_Count
+FROM dcpublic.DC_E_RBSG2_NODEBLOCCELLGRP_RAW
+WHERE ROWSTATUS like 'Loaded'
+AND RBS in (${NODES})
+Group by OSS_ID, RBS) as query3
+UNION
+SELECT SUM(Inner_Cell_Count) AS Cell_Count FROM ( SELECT
+COUNT(DISTINCT NodeBLocalCellGroup) AS Inner_Cell_Count
+FROM dcpublic.DC_E_RBSG2_NODEBLOCCELLGRP_V_RAW
+WHERE ROWSTATUS like 'Loaded'
+AND RBS in (${NODES})
+Group by OSS_ID, RBS) as query4)
+UNION ALL
+SELECT
+COUNT(DISTINCT RBSLOCALCELL_FDN) AS Cell_Count
+FROM dcpublic.DIM_E_RAN_RBSLOCALCELL
+WHERE status like 'ACTIVE'
+AND RBS_ID in (${NODES})
+Group by OSS_ID, RBS_ID
+) AS internal_query
+go
+EOF
+        fi
+    elif [[ "$TECH" = "LTE" && ! -z "$NODES" ]] ; then
+        isql -s\; -w999 -b -Udcpublic -P${DCPUBLIC_PW} -Sdwhdb dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${OUTPUT_FILE_LOCATION}/cellCountFiles/radio_cell_${TECH}_${TYPE}_count.txt
+SELECT COALESCE(SUM(Cell_Count),0) AS [Cell Count], COALESCE(SUM(Node_Count),0) AS [Node Count]
+FROM(
+SELECT
+COUNT(DISTINCT CELL_ID) AS Cell_Count,
+COUNT(DISTINCT ERBS_NAME) AS Node_Count
+FROM dcpublic.DIM_LTE_CELL
+WHERE status like 'ACTIVE'
+AND ERBS_NAME IN (${NODES})
+Group by OSS_ID, ERBS_NAME
+) AS internal_query
+go
+EOF
+    elif [[ "$TECH" = "5GNR" && ! -z "$NODES" ]] ; then
+        isql -s\; -w999 -b -Udcpublic -P${DCPUBLIC_PW} -Sdwhdb dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g'  > ${OUTPUT_FILE_LOCATION}/cellCountFiles/radio_cell_${TECH}_${TYPE}_count.txt
+SELECT COALESCE(SUM(Cell_Count),0) AS [Cell Count], COALESCE(SUM(Node_Count),0) AS [Node Count]
+FROM(
+SELECT
+COUNT(DISTINCT NRCELLDU_ID) AS Cell_Count,
+COUNT(DISTINCT NR_NAME) AS Node_Count
+FROM dcpublic.DIM_E_LTE_NR_NRCELLDU
+WHERE status like 'ACTIVE'
+AND NR_NAME in (${NODES})
+Group by OSS_ID, NR_NAME
+) AS internal_query
+go
+EOF
+    fi
+}
+
+collectCellDetails() {
+    OUTPUT_FILE_LOCATION=/eniq/log/assureddc/radioNode
+    INPUT_FILE_LOCATION=/tmp
+    INPUT_FILE_NAME=radio_G1_G2_mixed_node_list.txt
+
+    log "Collecting Cell data."
+    if [ ! -d ${OUTPUT_FILE_LOCATION}/cellCountFiles ] ; then
+        log "INFO: Creating log directory ${OUTPUT_FILE_LOCATION}/cellCountFiles."
+        ${MKDIR} -p ${OUTPUT_FILE_LOCATION}/cellCountFiles
+        if [ ${?} -ne 0 ]; then
+            log "ERROR: Unable to create the output log dir.. Stopping script execution.."
+            return 1
+        fi
+    fi
+
+    log "INFO: Removing the old files of Cell information"
+    ${FIND} ${OUTPUT_FILE_LOCATION}/cellCountFiles -name "radio_cell_*.txt" | xargs ${RM} -f;
+
+    if [ -f "${INPUT_FILE_LOCATION}/${INPUT_FILE_NAME}" ] ; then
+        GSM_NODES_G1=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "GSM" "G1")
+        collectCellCount "GSM" "$GSM_NODES_G1" "G1"
+
+        GSM_NODES_G2=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "GSM" "G2")
+        collectCellCount "GSM" "$GSM_NODES_G2" "G2"
+
+        GSM_NODES_Mixed=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "GSM" "Mixed")
+        collectCellCount "GSM" "$GSM_NODES_Mixed" "Mixed"
+
+        WCDMA_NODES_G1=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "WCDMA" "G1")
+        collectCellCount "WCDMA" "$WCDMA_NODES_G1" "G1"
+
+        WCDMA_NODES_G2=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "WCDMA" "G2")
+        collectCellCount "WCDMA" "$WCDMA_NODES_G2" "G2"
+
+        WCDMA_NODES_Mixed=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "WCDMA" "Mixed")
+        collectCellCount "WCDMA" "$WCDMA_NODES_Mixed" "Mixed"
+
+        WCDMA_NODES_RNC=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "WCDMA" "RNC")
+        collectCellCount "WCDMA" "$WCDMA_NODES_RNC" "RNC"
+
+        WCDMA_NODES_PICO=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "WCDMA" "PICO")
+        collectCellCount "WCDMA" "$WCDMA_NODES_PICO" "PICO"
+
+        LTE_NODES_G1=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "LTE" "G1")
+        collectCellCount "LTE" "$LTE_NODES_G1" "G1"
+
+        LTE_NODES_G2=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "LTE" "G2")
+        collectCellCount "LTE" "$LTE_NODES_G2" "G2"
+
+        LTE_NODES_Mixed=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "LTE" "Mixed")
+        collectCellCount "LTE" "$LTE_NODES_Mixed" "Mixed"
+
+        LTE_NODES_PICO=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "LTE" "PICO")
+        collectCellCount "LTE" "$LTE_NODES_PICO" "PICO"
+
+        NR_NODES_G1=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "5G NR" "G1")
+        collectCellCount "5GNR" "$NR_NODES_G1" "G1"
+
+        NR_NODES_G2=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "5G NR" "G2")
+        collectCellCount "5GNR" "$NR_NODES_G2" "G2"
+
+        NR_NODES_Mixed=$(inputFileToArray "${INPUT_FILE_NAME}" "${INPUT_FILE_LOCATION}" "5G NR" "Mixed")
+        collectCellCount "5GNR" "$NR_NODES_Mixed" "Mixed"
+    fi
+}
+
+collect_radio_node_cell_count_logfile() {
+    log "Executing Node and Cell count log under plugin_data directory"
+    RADIO_NODE_CELL_LOG_FILE=$(find /tmp -name "radio_*_*_*count.txt")
+    if [ -n "${RADIO_NODE_CELL_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/radioNode ] ; then
+            ${MKDIR} -p ${PLUGIN_DATA_DIR}/radioNode
+        fi
+        log "Collecting Radio Node and Cell count logs under plugin_data directory"
+        for LOG in ${RADIO_NODE_CELL_LOG_FILE} ; do
+            cp $LOG ${PLUGIN_DATA_DIR}/radioNode
+        done
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/radioNode/*
+        ${FIND} /tmp -name "radio_*_*_*.txt" | xargs ${RM} -f > /dev/null 2>&1;
+    fi
+}
+
+collectFLSLog() {
+    log "Executing FLS log collection"
+    FILE_DATE=$(echo ${SQL_DATE_ONLY} | sed 's/-/_/g')
+    FLS_LOG_FILE=$(find /eniq/log/sw_log/symboliclinkcreator -name "symboliclinkcreator-${FILE_DATE}.log")
+    if [ -n "${FLS_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/file_lookup_service ] ; then
+            mkdir -p ${PLUGIN_DATA_DIR}/file_lookup_service
+        fi
+        log "Collecting FLS log under plugin_data directory"
+        cp ${FLS_LOG_FILE} ${PLUGIN_DATA_DIR}/file_lookup_service
+        if [ $? -eq 0 ] ; then
+            log "${FLS_LOG_FILE} log file collected successfully under /plugin_data/file_lookup_service directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/file_lookup_service/*
+    else
+        log "FLS log file symboliclinkcreator-${FILE_DATE}.log is not available under /eniq/log/sw_log/symboliclinkcreator directory."
+    fi
+}
+
+collectOSSIntegrationLog() {
+    log "Executing OSS Integration log collection"
+    OSS_INTEGRATION_LOG_FILE=$(find /eniq/log/assureddc/file_lookup_service -name "fls_oss_integration_mode.json")
+    if [ -n "${OSS_INTEGRATION_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/file_lookup_service ] ; then
+            mkdir -p ${PLUGIN_DATA_DIR}/file_lookup_service
+        fi
+        log "Collecting OSS Integration file under plugin_data directory"
+        cp ${OSS_INTEGRATION_LOG_FILE} ${PLUGIN_DATA_DIR}/file_lookup_service
+        if [ $? -eq 0 ] ; then
+            log "${OSS_INTEGRATION_LOG_FILE} log file collected successfully under /plugin_data/file_lookup_service directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/file_lookup_service/fls_oss_integration_mode.json
+        ${FIND} /eniq/log/assureddc/file_lookup_service -name "fls_oss_integration_mode.json" | xargs ${RM} -f > /dev/null 2>&1;
+    else
+        log "OSS Integration log file fls_oss_integration_mode.json is not available under /eniq/log/assureddc/file_lookup_service directory."
+    fi
+}
+
+collectRhelOSAndPatchVersionLogs() {
+    log "Executing RHEL version and patch version logs collection"
+    RHEL_VERSION_LOG_FILE=$(ls /etc/redhat-release)
+    PATCH_VERSION_LOG_FILE=$(find /var/ericsson/log/patch -name "pre_upgrade_patchrhel.bsh_??-??-????_??-??-??.log" -printf "%T@ %p\n" -ls | sort -n | cut -d' ' -f 2- | tail -n 1)
+    if [ -n "${RHEL_VERSION_LOG_FILE}" ] || [ -n "${PATCH_VERSION_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/rhel_patch_version ] ; then
+            mkdir -p ${PLUGIN_DATA_DIR}/rhel_patch_version
+        fi
+        log "Collecting rhel version log under plugin_data directory"
+        if [ -n "${RHEL_VERSION_LOG_FILE}" ]; then
+            cp ${RHEL_VERSION_LOG_FILE} ${PLUGIN_DATA_DIR}/rhel_patch_version
+            if [ $? -eq 0 ] ; then
+                log "${RHEL_VERSION_LOG_FILE} log file collected successfully under /plugin_data/rhel_patch_version directory."
+            fi
+        else
+            log "RHEL version log file redhat-release is not available under /etc directory."
+        fi
+        log "Collecting patch version log under plugin_data directory"
+        if [ -n "${PATCH_VERSION_LOG_FILE}" ]; then
+            cp ${PATCH_VERSION_LOG_FILE} ${PLUGIN_DATA_DIR}/rhel_patch_version
+            if [ $? -eq 0 ] ; then
+                log "${PATCH_VERSION_LOG_FILE} log file collected successfully under /plugin_data/rhel_patch_version directory."
+            fi
+        else
+            log "Patch version log file pre_upgrade_patchrhel.bsh_??_.log is not available under /var/ericsson/log/patch directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/rhel_patch_version/*
+    fi
+}
+
+collectAccessedAndAggregationFailureCounterLogs() {
+    log "Executing accessed counter log and Aggregation Failure log file collection."
+    YESTERDAY_DATE_FILE_ONLY=$(/usr/bin/date --date='yesterday' +'%d-%m-%Y')
+    ACCESSED_COUNTER_LOG_FILE=$(find /eniq/backup/ddc_aggregated -name "${YESTERDAY_DATE_FILE_ONLY}_aggregated.log")
+    AGGREGATION_FAILED_FLAG_LOG_FILE=$(find /eniq/log/sw_log/iq/CounterTool -name ".failed_aggregation_flag.txt")
+
+    if [ -n "${ACCESSED_COUNTER_LOG_FILE}" ] || [ -n "${AGGREGATION_FAILED_FLAG_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/counterTool ] ; then
+            mkdir -p ${PLUGIN_DATA_DIR}/counterTool
+        fi
+        if [ -n "${ACCESSED_COUNTER_LOG_FILE}" ]; then
+            log "Collecting accessed counter log file under plugin_data directory."
+            cp ${ACCESSED_COUNTER_LOG_FILE} ${PLUGIN_DATA_DIR}/counterTool
+            if [ ${?} -eq 0 ]; then
+                log "Accessed counter log file ${ACCESSED_COUNTER_LOG_FILE} is collected successfully under /plugin_data/counterTool/ directory."
+            else
+                log "Accessed counter log file ${YESTERDAY_DATE_FILE_ONLY}_aggregated.log is not available under /eniq/backup/ddc_aggregated directory."
+            fi
+            log "Removing accessed counter log file."
+            rm -rf ${ACCESSED_COUNTER_LOG_FILE}
+        fi
+
+        if [ -n "${AGGREGATION_FAILED_FLAG_LOG_FILE}" ]; then
+            log "Collecting Aggregation Failure log file under plugin_data directory"
+            cp -f ${AGGREGATION_FAILED_FLAG_LOG_FILE} ${PLUGIN_DATA_DIR}/counterTool
+            if [ ${?} -eq 0 ]; then
+                log "Aggregation Failure log file  ${AGGREGATION_FAILED_FLAG_LOG_FILE} is collected successfully under /plugin_data/counterTool/ directory."
+            fi
+            mv  ${PLUGIN_DATA_DIR}/counterTool/.failed_aggregation_flag.txt  ${PLUGIN_DATA_DIR}/counterTool/failed_aggregation_flag.txt
+        else
+            log "Aggregation Failure log file .failed_aggregation_flag.txt is not available under /eniq/log/sw_log/iq/CounterTool directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/counterTool/*
+    fi
+}
+
+collectOsMessages() {
+    log "Executing Os Messages log collection"
+    OS_MESSAGES_LOG_FILE=$(find /var/log -name "messages")
+    if [ -n "${OS_MESSAGES_LOG_FILE}" ]; then
+        log "Collecting Os Messages log under server directory"
+        cp -f ${OS_MESSAGES_LOG_FILE} ${SERVER_DIR}/messages
+        if [ ${?} -eq 0 ]; then
+            log "Os Messages log file ${OS_MESSAGES_LOG_FILE} is collected successfully under server directory."
+        fi
+        $_CHMOD 644 ${SERVER_DIR}/messages
+    else
+        log "OS Messages log file messages is not available under /var/log directory."
+    fi
+}
+
+get_encrypted_file() {
+    conn_string_local=$1
+    encrypt_file_path=$2
+    input_file=/var/tmp/input.file
+    touch $encrypt_file_path
+    touch $input_file
+    chown dcuser:dc5000 $encrypt_file_path $input_file
+    echo $conn_string_local > ${input_file}
+    check_user=`whoami`
+    if [ ${check_user} == "dcuser" ]; then
+        ${IQDIR16}/bin64/dbfhide ${input_file} ${encrypt_file_path} >/dev/null 2>&1
+    else
+        su - dcuser -c "${IQDIR16}/bin64/dbfhide ${input_file} ${encrypt_file_path}" >/dev/null 2>&1
+    fi
+    rm -rf ${input_file}
+}
+
+collectDDPReport() {
+    log "Executing DDP Report log collection"
+    DDP_REPORT_LOG_FILE=$(find /eniq/log/sw_log/iq/bitmapDailyLogs -name "ddp.report")
+    if [ -n "${DDP_REPORT_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/ddp_report ] ; then
+            mkdir -p ${PLUGIN_DATA_DIR}/ddp_report
+        fi
+        log "Collecting ddp report log under plugin_data directory"
+        cp -f ${DDP_REPORT_LOG_FILE} ${PLUGIN_DATA_DIR}/ddp_report
+        if [ ${?} -eq 0 ]; then
+            log "DDP Report log file ${DDP_REPORT_LOG_FILE} is collected successfully under plugin_data directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/ddp_report/ddp.report
+    else
+        log "DDP Report log file ddp.report is not available under /eniq/log/sw_log/iq/bitmapDailyLogs directory."
+    fi
+}
+
+get_transport_ims_core_node_query_output() {
+    queryValue=$1
+    technologyValue=$2
+    nodeTypeValue=$3
+    dcPasswordValue=$4
+
+    $_ECHO "Technology:$technologyValue" >> /eniq/log/assureddc/transportIMSCoreNode/transport_ims_core_node_info.log
+    $_ECHO "NodeType:$nodeTypeValue" >> /eniq/log/assureddc/transportIMSCoreNode/transport_ims_core_node_info.log
+isql -s\; -w999 -b -Udc -P${dcPasswordValue} -Sdwhdb dwhdb <<EOF | sed 's/ *;/;/g' | sed 's/; */;/g' >> /eniq/log/assureddc/transportIMSCoreNode/transport_ims_core_node_info.log
+$queryValue
+go
+EOF
+}
+
+collectTransportIMSCoreNodeLog() {
+    log "Fetching Transport IMS and Core node data"
+    output_log_location="/eniq/log/assureddc"
+    if [ ! -d "${output_log_location}/transportIMSCoreNode" ]; then
+        log "INFO: Creating log directory ${output_log_location}/transportIMSCoreNode"
+        ${MKDIR} -p ${output_log_location}/transportIMSCoreNode
+        if [ ${?} -ne 0 ]; then
+            log "ERROR: Unable to create the output log dir.. Stopping script execution.."
+            return 1
+        fi
+    fi
+    log "INFO: Removing the old file of Transport IMS and Core node data"
+    ${FIND} ${output_log_location}/transportIMSCoreNode -name "transport_ims_core_node_info.log" | xargs ${RM} -f;
+    DC_PW=`getIqPassword DC`
+    if [ -z "${DC_PW}" ]  ; then
+        log "Transport IMS and Core node data Log not created as DC_PW is empty"
+        return 0;
+    fi
+    query_file_path="/opt/ericsson/ERICddc/monitor/appl/ENIQ/transport_ims_core_node_queries.txt"
+    while IFS= read -r line
+    do
+        query=$($_ECHO $line | $CUT -f1 -d ";")
+        technology=$($_ECHO $line | $CUT -f2 -d ";")
+        nodeType=$($_ECHO $line | $CUT -f3 -d ";")
+        get_transport_ims_core_node_query_output "$query" "$technology" "$nodeType" "$DC_PW"
+    done < "$query_file_path"
+
+    log "Executing Transport IMS and Core node data log collection under plugin_data directory"
+    TRANSPORT_IMS_CORE_NODE_LOG_FILE=$(find ${output_log_location}/transportIMSCoreNode -name "transport_ims_core_node_info.log")
+    if [ -n "${TRANSPORT_IMS_CORE_NODE_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/transportIMSCoreNode ] ; then
+            ${MKDIR} -p ${PLUGIN_DATA_DIR}/transportIMSCoreNode
+        fi
+        log "Collecting Transport IMS and Core node data log under plugin_data directory"
+        cp ${TRANSPORT_IMS_CORE_NODE_LOG_FILE} ${PLUGIN_DATA_DIR}/transportIMSCoreNode
+        if [ ${?} -eq 0 ]; then
+            log "Transport IMS and Core node data log file is collected successfully under plugin_data directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/transportIMSCoreNode/transport_ims_core_node_info.log
+    else
+        log "Transport IMS and Core node data log file transport_ims_core_node_info.log is not available under ${output_log_location}/transportIMSCoreNode directory."
+    fi
+}
+
+collectInstalledFeaturesLogs() {
+    log "Executing Installed feature log collection"
+    INSTALLED_FEATURE_LOG_FILE=$(find /eniq/log/assureddc/installed_features -name "installed_feature.json")
+    if [ -n "${INSTALLED_FEATURE_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/installed_features ] ; then
+            mkdir -p ${PLUGIN_DATA_DIR}/installed_features
+        fi
+        log "Collecting Installed feature file under plugin_data directory"
+        cp ${INSTALLED_FEATURE_LOG_FILE} ${PLUGIN_DATA_DIR}/installed_features
+        if [ $? -eq 0 ] ; then
+            log "${INSTALLED_FEATURE_LOG_FILE} log file collected successfully under /plugin_data/installed_features directory."
+        fi
+        ${FIND} /eniq/log/assureddc/installed_features -name "installed_feature.json" | xargs ${RM} -f > /dev/null 2>&1;
+    else
+        log "Installed feature log file installed_feature.json is not available under /eniq/log/assureddc/installed_features directory."
+    fi
+}
+
+collectIloConfigFile() {
+    log "Executing ILO config file collection"
+    ILO_CONFIG_FILE=$(find /eniq/installation/config/ilo_nodes_conf_file -name "ilo.cfg")
+    if [ -n "${ILO_CONFIG_FILE}" ]; then
+        log "Collecting ilo.cfg file under ${ILO_DIR} directory"
+        cp -f ${ILO_CONFIG_FILE} ${ILO_DIR}/ilo.cfg
+        if [ ${?} -eq 0 ]; then
+            log "ilo.cfg file collected successfully under ${ILO_DIR} directory."
+        fi
+        $_CHMOD 644 ${ILO_DIR}/ilo.cfg
+    else
+        log "ILO config file ilo.cfg is not available under /eniq/installation/config/ilo_nodes_conf_file directory."
+    fi
+}
+
+collectFCSwitchPortDetails() {
+    log "Executing FC Switch port log collection"
+    REQUIRED_DATE_FORMAT=$(/usr/bin/date +'%Y%m%d')
+    FC_SWITCH_PORT_LOG_FILE=$(find /var/log/hwcomm -name "hwmonitor_monitor_${REQUIRED_DATE_FORMAT}_0.log")
+    if [ -n "${FC_SWITCH_PORT_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/fc_switch_port_alarm ] ; then
+            ${MKDIR} -p ${PLUGIN_DATA_DIR}/fc_switch_port_alarm
+        fi
+        log "Collecting FC Switch port log collection under plugin_data directory"
+        cp -f ${FC_SWITCH_PORT_LOG_FILE} ${PLUGIN_DATA_DIR}/fc_switch_port_alarm
+        if [ ${?} -eq 0 ]; then
+             log "FC Switch port log file is collected successfully under /plugin_data/fc_switch_port_alarm directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/fc_switch_port_alarm/*
+    else
+        log "FC Switch port log file hwmonitor_monitor_${REQUIRED_DATE_FORMAT}_0.log is not available under /var/log/hwcomm directory."
+    fi
+}
+
+collectIQDiagnosticLog() {
+    log "Executing IQSYSTEM diagnostic log collection."
+    IQ_DIAGNOSTIC_MAIN_LOG_FILE=$(find /eniq/log/sw_log/iq/iq_diag -name "${SQL_DATE_ONLY}_diagnostic.tar.gz")
+    if [ -n "${IQ_DIAGNOSTIC_MAIN_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/iq_diagnostic ] ; then
+            ${MKDIR} -p ${PLUGIN_DATA_DIR}/iq_diagnostic
+        fi
+        log "Collecting IQ diagnostic log under plugin_data directory."
+        cp -f ${IQ_DIAGNOSTIC_MAIN_LOG_FILE} ${PLUGIN_DATA_DIR}/iq_diagnostic
+        if [ ${?} -eq 0 ]; then
+            log "IQ diagnostic log file is collected successfully under plugin_data directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/iq_diagnostic/*
+    else
+        log "IQSYSTEM diagnostic log file ${SQL_DATE_ONLY}_diagnostic.tar.gz is not available under /eniq/log/sw_log/iq/iq_diag directory."
+    fi
+}
+
+collectOmPatchMedia() {
+    log "Executing ENIQ OM patch media file collection."
+    OM_PATCH_LOG_LOCATION="/eniq/installation/config"
+    ENIQ_PATCH_HISTORY=$(find ${OM_PATCH_LOG_LOCATION} -name "eniq_patch_history")
+    ENIQ_OM_HISTORY=$(find ${OM_PATCH_LOG_LOCATION} -name "eniq_om_history")
+    ENIQ_PATCH_STATUS=$(find ${OM_PATCH_LOG_LOCATION} -name "eniq_patch_status")
+    ENIQ_OM_STATUS=$(find ${OM_PATCH_LOG_LOCATION} -name "eniq_om_status")
+    if [ -n "${ENIQ_PATCH_HISTORY}" ] || [ -n "${ENIQ_OM_HISTORY}" ] || [ -n "${ENIQ_PATCH_STATUS}" ] || [ -n "${ENIQ_OM_STATUS}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/om_patch_media_info ] ; then
+            mkdir -p ${PLUGIN_DATA_DIR}/om_patch_media_info
+        fi
+
+        if [ -n "${ENIQ_PATCH_HISTORY}" ]; then
+            log "Collecting ENIQ patch history log file under plugin_data directory."
+            cp -f ${ENIQ_PATCH_HISTORY} ${PLUGIN_DATA_DIR}/om_patch_media_info
+            if [ ${?} -eq 0 ]; then
+                log "ENIQ patch history file ${ENIQ_PATCH_HISTORY} is collected successfully under plugin_data directory."
+            fi
+        else
+            log "ENIQ patch history file ${ENIQ_PATCH_HISTORY} is not available under ${OM_PATCH_LOG_LOCATION} directory."
+        fi
+
+        if [ -n "${ENIQ_OM_HISTORY}" ]; then
+            log "Collecting ENIQ OM history file under plugin_data directory"
+            cp -f ${ENIQ_OM_HISTORY} ${PLUGIN_DATA_DIR}/om_patch_media_info
+            if [ ${?} -eq 0 ]; then
+                log "ENIQ OM history file ${ENIQ_OM_HISTORY} is collected successfully under plugin_data directory."
+            fi
+        else
+             log "ENIQ OM history file ${ENIQ_OM_HISTORY} is not available under ${OM_PATCH_LOG_LOCATION} directory."
+        fi
+
+        if [ -n "${ENIQ_PATCH_STATUS}" ]; then
+            log "Collecting ENIQ patch status file under plugin_data directory"
+            cp -f ${ENIQ_PATCH_STATUS} ${PLUGIN_DATA_DIR}/om_patch_media_info
+            if [ ${?} -eq 0 ]; then
+                log "ENIQ patch status file ${ENIQ_PATCH_STATUS} is collected successfully under plugin_data directory."
+            fi
+        else
+             log "ENIQ patch status file ${ENIQ_PATCH_STATUS} is not available under ${OM_PATCH_LOG_LOCATION} directory."
+        fi
+
+        if [ -n "${ENIQ_OM_STATUS}" ]; then
+            log "Collecting ENIQ OM staus file under plugin_data directory"
+            cp -f ${ENIQ_OM_STATUS} ${PLUGIN_DATA_DIR}/om_patch_media_info
+            if [ ${?} -eq 0 ]; then
+                log "ENIQ OM status file ${ENIQ_OM_STATUS} is collected successfully under plugin_data directory."
+            fi
+        else
+             log "ENIQ OM staus file ${ENIQ_OM_STATUS} is not available under ${OM_PATCH_LOG_LOCATION} directory."
+        fi
+
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/om_patch_media_info/*
+    fi
+}
+
+collectDBCCLogs() {
+    log "Executing DBCC tables check log collection under plugin_data directory"
+    REQUIRED_DATE_FORMAT=$(/usr/bin/date +'%d.%m.%y')
+    DATE=$(/usr/bin/date '+%Y-%b-%d')
+    HOSTNAME=`hostname`
+    DBCC_LOG_LOCATION="/eniq/log/sw_log/iq/DbCheckLogs"
+    CheckedTablesLogFile=$(find ${DBCC_LOG_LOCATION} -name "CheckedTables_${REQUIRED_DATE_FORMAT}_*.log")
+    HostnameCronDbccFile=$(find ${DBCC_LOG_LOCATION} -name "${HOSTNAME}_cron_dbcc_log_${DATE}_*")
+    IndexErrorFile=$(find ${DBCC_LOG_LOCATION} -name "IndexError.log")
+    SecondLevelCheckFile=$(find ${DBCC_LOG_LOCATION} -name "SecondLevelCheckTable.log")
+    NotCheckedTablesfile=$(find ${DBCC_LOG_LOCATION} -name "NotCheckedTables.log")
+    DBCheckEnvFile=$(find /eniq/admin/etc -name "dbcheck.env")
+    NotVerifiedIndexFile=$(find ${DBCC_LOG_LOCATION} -name "NotVerifiedIndex.log")
+
+    if [ -n "${CheckedTablesLogFile}" ] || [ -n "${HostnameCronDbccFile}" ] || [ -n "${IndexErrorFile}" ] ||
+    [ -n "${SecondLevelCheckFile}" ] || [ -n "${NotCheckedTablesfile}" ] || [ -n "${DBCheckEnvFile}" ] || [ -n "${NotVerifiedIndexFile}" ] ; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/database_consistency_check ] ; then
+            ${MKDIR} -p ${PLUGIN_DATA_DIR}/database_consistency_check
+        fi
+
+        if [ -n "${CheckedTablesLogFile}" ]; then
+            log "Collecting DBCC CheckedTables log files under plugin_data directory."
+            for LOG in ${CheckedTablesLogFile} ; do
+                cp -f ${LOG} ${PLUGIN_DATA_DIR}/database_consistency_check
+                if [ ${?} -eq 0 ]; then
+                    log "DBCC checked tables log file ${LOG} is collected successfully under plugin_data directory."
+                fi
+            done
+        else
+            log "DBCC checked tables log files ${CheckedTablesLogFile} are not available under ${DBCC_LOG_LOCATION} directory."
+        fi
+
+        if [ -n "${HostnameCronDbccFile}" ]; then
+            log "Collecting cron dbcc log files under plugin_data directory."
+            for LOG in ${HostnameCronDbccFile} ; do
+                cp -f ${LOG} ${PLUGIN_DATA_DIR}/database_consistency_check
+                if [ ${?} -eq 0 ]; then
+                    log "Cron dbcc files ${LOG} is collected successfully under plugin_data directory."
+                fi
+            done
+        else
+            log "Cron dbcc files ${HostnameCronDbccFile} are not available under ${DBCC_LOG_LOCATION} directory."
+        fi
+
+        if [ -n "${IndexErrorFile}" ]; then
+            log "Collecting DBCC index error file under plugin_data directory."
+            cp -f ${IndexErrorFile} ${PLUGIN_DATA_DIR}/database_consistency_check
+            if [ ${?} -eq 0 ]; then
+                log "DBCC index error log file ${IndexErrorFile} is collected successfully under plugin_data directory."
+            fi
+        else
+            log "DBCC index error log file ${IndexErrorFile} is not available under ${DBCC_LOG_LOCATION} directory."
+        fi
+
+        if [ -n "${SecondLevelCheckFile}" ]; then
+            log "Collecting DBCC second level check file under plugin_data directory."
+            cp -f ${SecondLevelCheckFile} ${PLUGIN_DATA_DIR}/database_consistency_check
+            if [ ${?} -eq 0 ]; then
+                log "DBCC second level check file ${SecondLevelCheckFile} is collected successfully under plugin_data directory."
+            fi
+        else
+            log "DBCC second level check file ${SecondLevelCheckFile} is not available under ${DBCC_LOG_LOCATION} directory."
+        fi
+
+        if [ -n "${NotCheckedTablesfile}" ]; then
+            log "Collecting DBCC not checked tables file under plugin_data directory."
+            cp -f ${NotCheckedTablesfile} ${PLUGIN_DATA_DIR}/database_consistency_check
+            if [ ${?} -eq 0 ]; then
+                log "DBCC not checked tables file ${NotCheckedTablesfile} is collected successfully under plugin_data directory."
+            fi
+        else
+            log "DBCC not checked tables file ${NotCheckedTablesfile} is not available under ${DBCC_LOG_LOCATION} directory."
+        fi
+
+        if [ -n "${DBCheckEnvFile}" ]; then
+            log "Collecting db check env file under plugin_data directory."
+            cp -f ${DBCheckEnvFile} ${PLUGIN_DATA_DIR}/database_consistency_check
+            if [ ${?} -eq 0 ]; then
+                log "Db check env file ${DBCheckEnvFile} is collected successfully under plugin_data directory."
+            fi
+        else
+            log "Db check env file ${DBCheckEnvFile} is not available under /eniq/admin/etc directory."
+        fi
+
+        if [ -n "${NotVerifiedIndexFile}" ]; then
+            log "Collecting DBCC not verified index file under plugin_data directory."
+            cp -f ${NotVerifiedIndexFile} ${PLUGIN_DATA_DIR}/database_consistency_check
+            if [ ${?} -eq 0 ]; then
+                log "DBCC not verified index file ${NotVerifiedIndexFile} is collected successfully under plugin_data directory."
+            fi
+        else
+            log "DBCC not verified index file ${NotVerifiedIndexFile} is not available under ${DBCC_LOG_LOCATION} directory."
+        fi
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/database_consistency_check/*
+    fi
+}
+
+collectNodeHardeningLog() {
+    log "Executing node hardening log collection"
+    NODE_HARDENING_LOG_FILE=$(find /eniq/log/assureddc/node_hardening -name "node_hardening*.json")
+    if [ -n "${NODE_HARDENING_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/node_hardening ] ; then
+            ${MKDIR} -p ${PLUGIN_DATA_DIR}/node_hardening
+        fi
+        log "Collecting node hardening log under plugin_data directory"
+        for LOG in ${NODE_HARDENING_LOG_FILE} ; do
+            cp -f ${LOG} ${PLUGIN_DATA_DIR}/node_hardening
+            if [ ${?} -eq 0 ]; then
+                log "Node Hardening log file ${LOG} is collected successfully under plugin_data directory."
+            fi
+        done
+        ${FIND} /eniq/log/assureddc/node_hardening -name "node_hardening*.json" | xargs ${RM} -f > /dev/null 2>&1;
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/node_hardening/*
+    else
+        log "Node Hardening log file is not available under /eniq/log/assureddc/node_hardening directory."
+    fi
+}
+
+collectEniqHistoryActivityLog() {
+    log "Executing eniq history activity log collection"
+    ENIQ_HISTORY_ACTIVITY_LOG_FILE=$(find /eniq/log/assureddc/eniq_activity_history -name "eniq_activity_history*.json")
+    if [ -n "${ENIQ_HISTORY_ACTIVITY_LOG_FILE}" ]; then
+        if [ ! -d ${PLUGIN_DATA_DIR}/eniq_activity_history ] ; then
+            ${MKDIR} -p ${PLUGIN_DATA_DIR}/eniq_activity_history
+        fi
+        log "Collecting eniq history activity log under plugin_data directory"
+        for LOG in ${ENIQ_HISTORY_ACTIVITY_LOG_FILE} ; do
+            cp -f ${LOG} ${PLUGIN_DATA_DIR}/eniq_activity_history
+            if [ ${?} -eq 0 ]; then
+                log "Eniq history activity log file ${LOG} is collected successfully under plugin_data directory."
+            fi
+        done
+        ${FIND} /eniq/log/assureddc/eniq_activity_history -name "eniq_activity_history*.json" | xargs ${RM} -f > /dev/null 2>&1;
+        $_CHMOD 644 ${PLUGIN_DATA_DIR}/eniq_activity_history/*
+    else
+        log "Eniq history activity log file is not available under /eniq/log/assureddc/eniq_activity_history directory."
+    fi
+}
+
+collectLunMpathIQMappingLogs() {
+    log "Executing Luns Mpath and IQ Header mapping log collection"
+    if [ ! -d ${PLUGIN_DATA_DIR}/lun_mpath_iq_header_mapping ] ; then
+        mkdir -p ${PLUGIN_DATA_DIR}/lun_mpath_iq_header_mapping
+    fi
+    MPATH_MAPPING_LOG_FILE=$(find /eniq/log/assureddc/lun_mpath_iq_header_mapping -name "lun_mpath_mapping*.json")
+    if [ -n "${MPATH_MAPPING_LOG_FILE}" ];then
+        log "Collecting lun mpath mapping log under plugin_data directory"
+        for LOG in ${MPATH_MAPPING_LOG_FILE} ; do
+            cp -f ${LOG} ${PLUGIN_DATA_DIR}/lun_mpath_iq_header_mapping
+            if [ ${?} -eq 0 ]; then
+                log "Lun mpath mapping log file ${LOG} is collected successfully under plugin_data directory."
+            fi
+        done
+        ${FIND} /eniq/log/assureddc/lun_mpath_iq_header_mapping -name "lun_mpath_mapping*.json" | xargs ${RM} -f > /dev/null 2>&1;
+    else
+        log "Lun mpath mapping log file is not available under /eniq/log/assureddc/lun_mpath_iq_header_mapping directory."
+    fi
+    $_CHMOD 644 ${PLUGIN_DATA_DIR}/lun_mpath_iq_header_mapping/*
+}
+
+collectMpathIQHeaderFlagLogs() {
+    ${FIND} /eniq/log/assureddc/lun_mpath_iq_header_mapping -name "*not_correct*.txt" | xargs ${RM} -f > /dev/null 2>&1;
+    log "Executing Mpath and IQ Header flag file collection"
+    MPATH_INCORRECT_LOG_FILE=$(find /var/tmp -name "mpath_not_correct*.txt")
+    IQ_HEADER_INCORRECT_LOG_FILE=$(find /var/tmp -name "IQ_header_not_correct*.txt")
+    if [ ! -d ${PLUGIN_DATA_DIR}/lun_mpath_iq_header_mapping ] ; then
+        mkdir -p ${PLUGIN_DATA_DIR}/lun_mpath_iq_header_mapping
+    fi
+    if [ -n "${MPATH_INCORRECT_LOG_FILE}" ];then
+        log "Collecting mpath incorrect log under plugin_data directory"
+        cp -f ${MPATH_INCORRECT_LOG_FILE} ${PLUGIN_DATA_DIR}/lun_mpath_iq_header_mapping
+        if [ ${?} -eq 0 ]; then
+            log "mpath incorrect file ${MPATH_INCORRECT_LOG_FILE} is collected successfully under plugin_data directory."
+        fi
+    else
+        log "LUNs Mpath Incorrect log file mpath_not_correct.txt is not available under /var/tmp directory."
+    fi
+
+    if [ -n "${IQ_HEADER_INCORRECT_LOG_FILE}" ];then
+        log "Collecting IQ header log under plugin_data directory"
+        cp -f ${IQ_HEADER_INCORRECT_LOG_FILE} ${PLUGIN_DATA_DIR}/lun_mpath_iq_header_mapping
+        if [ ${?} -eq 0 ]; then
+            log "IQ header incorrect file ${IQ_HEADER_INCORRECT_LOG_FILE} is collected successfully under plugin_data directory."
+        fi
+    else
+        log "IQ header Incorrect log file IQ_header_not_correct.txt is not available under /var/tmp directory."
+    fi
+    $_CHMOD 644 ${PLUGIN_DATA_DIR}/lun_mpath_iq_header_mapping/*
+}
+
+

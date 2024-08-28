@@ -1,0 +1,46 @@
+#!/usr/bin/perl
+###################################################################################
+#  Description --------- eniqHistoryActivityDataCollection --------------------
+#  This script parses eniq activity history logs and stores data to JSON format
+###################################################################################
+
+use strict;
+use warnings;
+use JSON;
+
+sub main {
+    my $outputDir = "/eniq/log/assureddc/eniq_activity_history";
+    if ( !(-d $outputDir) ) {
+        mkdir $outputDir;
+    }
+    my $eniqActivityHistoryFile = "/eniq/local_logs/eniq_activity_history.log";
+    my @eniqActivityHistoryArrayData = ();
+    if ( -e $eniqActivityHistoryFile ) {
+        open FILE, "<$eniqActivityHistoryFile" or die "Can't open file to read $eniqActivityHistoryFile\n";
+        while ( my $line = <FILE> ) {
+            if ( $line =~ /^ENIQ ACTIVITY INFO=(.*);(.*);(.*)$/ ) {
+                my %eniqActivityHistoryData = (
+                    name => $1,
+                    completionTime => $2,
+                    description => $3
+                );
+                push(@eniqActivityHistoryArrayData, \%eniqActivityHistoryData);
+            }
+        }
+        close FILE;
+
+        if ( $#eniqActivityHistoryArrayData > -1 ) {
+            my $hostName = `hostname`;
+            chomp $hostName;
+            my $serverType = `cat /eniq/installation/config/installed_server_type`;
+            chomp $serverType;
+            my $host_type = $hostName."-".$serverType;
+            my $json_data = encode_json \@eniqActivityHistoryArrayData;
+            open(JSON, ">$outputDir/eniq_activity_history-$host_type.json") or die "cannot open file for reading: $!";
+            print JSON $json_data."\n";
+            close JSON;
+        }
+    }
+}
+
+main();

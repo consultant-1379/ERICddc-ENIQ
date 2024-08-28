@@ -1,0 +1,83 @@
+#!/usr/bin/perl
+######################################################################
+# This script collects information about ENIQ services that
+# had a restart/stop from the corresponding log files.
+######################################################################
+
+use strict;
+
+our @eniqServiceList;
+our $logDate = `date +%Y-%m-%d`;
+
+sub main {
+    manageLogFile();
+    createEniqSmfServiceList();
+    createEniqSmfServiceRestartList();
+
+}
+
+sub createEniqSmfServiceList {
+    logMessage("INFO: Capturing output of systemctl list-unit-files | grep eniq command.");
+    open (my $file, '>', 'temporary_service_restart.txt');
+    print $file `systemctl list-unit-files | grep eniq`;
+    close ($file);
+    open(FH, "<temporary_service_restart.txt");
+    while(<FH>) {
+        my ($serviceInstance, $serviceDescription) = split(/\s+/, $_, 0);
+        push @eniqServiceList, $serviceInstance;
+    }
+    close (FH);
+    unlink ("temporary_service_restart.txt");
+    logMessage("INFO: Prepared Eniq services list");
+}
+
+sub createEniqSmfServiceRestartList {
+    my @fileName = ();
+    our $serviceRestartFile;
+    our $fh;
+    logMessage("INFO: Creating ENIQ services restart information log file.");
+    chomp($logDate);
+    $serviceRestartFile = "/tmp/eniqServiceRestart-$logDate.txt";
+    foreach my $serviceName ( @eniqServiceList ) {
+        open($fh, '>>', $serviceRestartFile) or die "Could not open file '$serviceRestartFile' $!";
+        my $filename = "/tmp/serviceRestart_$serviceName.txt";
+        open (my $file, '>', $filename);
+        print $file `journalctl -u "$serviceName" -S "00:00:00"`;
+        close ($file);
+        open(FH, "</tmp/serviceRestart_$serviceName.txt");
+        my @lines = reverse<FH>;
+        foreach my $line ( @lines ) {
+            if ($line =~ /Started.*Service./) {
+                print $fh "Service Name: $serviceName Error desciption: $line";
+            }
+
+        }
+        unlink ("/tmp/serviceRestart_$serviceName.txt");
+        close (FH);
+    }
+    my $filesizeServiceRestartFile = -s "$serviceRestartFile";
+    if ( $filesizeServiceRestartFile == 0 ) {
+        logMessage("INFO: No ENIQ services restart information exists for $logDate");
+        exit;
+    }
+    logMessage("INFO: Created ENIQ services restart information log file.");
+    close($fh);
+}
+
+sub logMessage {
+    my $hostname = `/usr/bin/hostname`;
+    chomp($hostname);
+    my $logMessage = shift;
+    my $loggingTimestamp = `date '+%Y-%m-%d %H:%M:%S'`;
+    chomp($loggingTimestamp);
+    `/usr/bin/echo "$loggingTimestamp $hostname ${0} INFO: $logMessage" >> /eniq/log/assureddc/ERICddc-ENIQ.log.$logDate`;
+}
+
+sub manageLogFile {
+    logMessage("Removing the old files of ENIQ Services restart log.");
+    `/usr/bin/rm -f /tmp/eniqServiceRestart-*.txt`;
+    `/usr/bin/rm -f /tmp/serviceRestart_*.txt`;
+
+}
+
+main ();

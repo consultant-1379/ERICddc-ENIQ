@@ -1,0 +1,54 @@
+#!/usr/bin/perl
+###################################################################################
+#  Description --------- lunMpathMappingDataCollection --------------------
+#  This script parses lun Mpath Mapping logs and stores data to JSON format
+###################################################################################
+
+use strict;
+use warnings;
+use JSON;
+use Data::Dumper;
+
+sub main {
+    my $outputDir = "/eniq/log/assureddc/lun_mpath_iq_header_mapping";
+
+    if ( !(-d $outputDir) ) {
+        mkdir $outputDir;
+    }
+
+    my $hostName = `hostname`;
+    chomp $hostName;
+    my $lunMpathMappingFile = "/var/tmp/mpath_iq_value_$hostName.log";
+    my $MpathIncorrectFile = "/var/tmp/mpath_not_correct_$hostName.txt";
+    my $IQHeaderIncorrectFile ="/var/tmp/IQ_header_not_correct_$hostName.txt";
+    my @lunMpathMappingArrayData = ();
+    if ( -e $lunMpathMappingFile ) {
+        open FILE, "<$lunMpathMappingFile" or die "Can't open file to read $lunMpathMappingFile\n";
+        while ( my $line = <FILE> ) {
+            if ( $line =~ /^(\S+);(\S+);(\S+);(\S+)$/ ) {
+                my %lunMpathMappingHistoryData = (
+                    disk => $1,
+                    mapping => $2,
+                    rawDeviceMapping => $3,
+                    iqHeaderId => $4
+                );
+                push(@lunMpathMappingArrayData, \%lunMpathMappingHistoryData);
+            }
+        }
+        close FILE;
+
+        if ( $#lunMpathMappingArrayData > -1 ) {
+            my $hostName = `hostname`;
+            chomp $hostName;
+            my $serverType = `cat /eniq/installation/config/installed_server_type`;
+            chomp $serverType;
+            my $host_type = $hostName."-".$serverType;
+            my $json_data = encode_json \@lunMpathMappingArrayData;
+            open(JSON, ">$outputDir/lun_mpath_mapping-$host_type.json") or die "cannot open file for reading: $!";
+            print JSON $json_data."\n";
+            close JSON;
+        }
+    }
+}
+
+main();

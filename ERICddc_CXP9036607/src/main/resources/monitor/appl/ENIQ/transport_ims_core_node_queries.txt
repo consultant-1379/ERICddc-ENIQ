@@ -1,0 +1,61 @@
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_IPTRANSPORT where STATUS = 'ACTIVE';TRANSPORT;ROUTER6k
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_IPTRANSPORT_MINILINK where (NE_TYPE not like 'MINI-LINK-635%' and NE_TYPE not like 'MINI-LINK-PT20%' and NE_TYPE  not like 'Switch-63%' and  NE_TYPE  not like 'Fronthaul%') and STATUS = 'ACTIVE';TRANSPORT;MINI-LINK Indoor
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_IPTRANSPORT_MINILINK where (NE_TYPE like 'MINI-LINK-635%' or NE_TYPE like 'MINI-LINK-PT20%' or NE_TYPE   like 'Switch-63%' or  NE_TYPE   like 'Fronthaul%') and STATUS = 'ACTIVE';TRANSPORT;MINI-LINK Outdoor
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_IPTRANSPORT_FRONTHAUL where STATUS = 'ACTIVE';TRANSPORT;FRONTHAUL
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_IPTRANSPORT_CISCO where STATUS = 'ACTIVE';TRANSPORT;CISCO-ASR
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_IPTRANSPORT_JUNOS where STATUS = 'ACTIVE';TRANSPORT;JUNIPER
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_IPTRANSPORT_ESC where STATUS = 'ACTIVE';TRANSPORT;SCU ESC
+select count(distinct TCU_NAME) as Number_of_Nodes from DIM_E_IPRAN_TCU where STATUS = 'ACTIVE';TRANSPORT;BASEBAND-T605
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_IMSGW where (NE_TYPE like 'SBG-IS' or NE_TYPE = 'Isite') and STATUS = 'ACTIVE';IMS;SBG-IS
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_IMS where NE_TYPE like 'CSCF-TSP' and STATUS = 'ACTIVE';IMS;CSCF-TSP
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_HSS where NE_TYPE like 'HSS-FE-TSP' and STATUS = 'ACTIVE';IMS;HSS-FE-TSP
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_MTAS where NE_TYPE like 'MTAS-TSP' and STATUS = 'ACTIVE';IMS;MTAS-TSP
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_IMSGW where NE_TYPE like '%SBG' and STATUS = 'ACTIVE';IMS;SBG vSBG
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_MTAS where NE_TYPE like '%MTAS' and STATUS = 'ACTIVE';IMS;MTAS vMTAS
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_DSC where STATUS = 'ACTIVE';IMS;DSC vDSC
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_IMS where NE_TYPE like '%CSCF' and STATUS = 'ACTIVE';IMS;CSCF vCSCF
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_HSS where NE_TYPE like '%HSS-FE' and STATUS = 'ACTIVE';IMS;HSS-FE vHSS-FE
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_IMS_IPW where STATUS = 'ACTIVE';IMS;IPWorks vIPWorks
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_MRSv where NE_TYPE like '%MRS%' and STATUS = 'ACTIVE';IMS;MRS vMRS
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_MRSv where NE_TYPE like '%MRF%' and STATUS = 'ACTIVE';IMS;MRF vMRF
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_MRSv where NE_TYPE like '%BGF%' and STATUS = 'ACTIVE';IMS;BGF vBGF
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_vEME where STATUS = 'ACTIVE';IMS;EME vEME
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_WCG where STATUS = 'ACTIVE';IMS;WCG vWCG DUA-S
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_IMS where NE_TYPE like 'MRF%' and STATUS = 'ACTIVE';IMS;MRFC MRF-PTT
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_IMS where NE_TYPE like 'PGM%' and STATUS = 'ACTIVE';IMS;PGM
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_IMS where NE_TYPE like 'PTT-AS%' and STATUS = 'ACTIVE';IMS;PTT-AS
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_IMS where NE_TYPE like 'IMS%' and STATUS = 'ACTIVE';IMS;IMS
+select count(distinct NODE_NAME) as Number_of_Nodes from DIM_E_CN_AFG where STATUS = 'ACTIVE';CORE;vAFG
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_SAPC where NE_TYPE like 'cSAPC-TSP' and STATUS = 'ACTIVE';CORE;cSAPC-TSP
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_BSP where STATUS = 'ACTIVE';CORE;BSP
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_SAPC where NE_TYPE like '%SAPC' and STATUS = 'ACTIVE';CORE;SAPC vSAPC eSAPC
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_UPG where STATUS = 'ACTIVE';CORE;UPG vUPG
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_WMG where NE_TYPE like '%WMG' and STATUS = 'ACTIVE';CORE;WMG vWMG
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_WMG where NE_TYPE like '%WMG-%' and STATUS = 'ACTIVE';CORE;WMG-OI vWMG-OI
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_CUDB where STATUS = 'ACTIVE';CORE;CUDB vCUDB
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_EIR where STATUS = 'ACTIVE';CORE;EIR-FE vEIR-FE
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_MGW where STATUS = 'ACTIVE';CORE;MGW M-MGW
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_GGSN where NE_TYPE like '%EPG' and STATUS = 'ACTIVE';CORE;EPG vEPG
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_GGSN where NE_TYPE like '%EPG-%' and STATUS = 'ACTIVE';CORE;EPG-OI vEPG-OI
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_SGSN where NE_TYPE like '%SGSN-%' and STATUS = 'ACTIVE';CORE;SGSN-MME vSGSN-MME
+select count(distinct NODE_NAME) as Number_of_Nodes from DIM_E_CN_SCEF where STATUS = 'ACTIVE';CORE;vECE
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE ='MSC-DB' and STATUS = 'ACTIVE';CORE;MSC-DB
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE ='MSC-DB-BSP' and STATUS = 'ACTIVE';CORE;MSC-DB-BSP
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE like '%MSC%' and STATUS = 'ACTIVE';CORE;MSC vMSC MSCServer vMSCServer
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE like '%STP' and STATUS = 'ACTIVE';CORE;IP-STP vIP-STP STP vSTP
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE ='IP-STP-BSP' and STATUS = 'ACTIVE';CORE;IP-STP-BSP
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE ='MSC-BC-IS' and STATUS = 'ACTIVE';CORE;MSC-BC-IS
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE ='MSC-BC-BSP' and STATUS = 'ACTIVE';CORE;MSC-BC-BSP
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE ='vMSC-HC' and STATUS = 'ACTIVE';CORE;vMSC-HC
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE ='MSC-BC' and STATUS = 'ACTIVE';CORE;MSC-BC
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE like '%HLR-FE' and STATUS = 'ACTIVE';CORE;HLR-FE vHLR-FE
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE ='HLR-FE-BSP' and STATUS = 'ACTIVE';CORE;HLR-FE-BSP
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE ='HLR-FE-IS' and STATUS = 'ACTIVE';CORE;HLR-FE-IS
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE ='HLR-S' and STATUS = 'ACTIVE';CORE;HLR-S
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_AXE where NE_TYPE ='HLR' and STATUS = 'ACTIVE';CORE;HLR
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_GGSN where NE_TYPE like 'GGSN%' and STATUS = 'ACTIVE';CORE;GGSN
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_HSS where NE_TYPE like '%HSS' and STATUS = 'ACTIVE';CORE;HSS
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_REDBACK where STATUS = 'ACTIVE';CORE;REDBACK
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_WMG where NE_TYPE like '%EPDG%' and STATUS = 'ACTIVE';CORE;EPDG
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_IMS_MGC where STATUS = 'ACTIVE';CORE;IS-MGC IS-MMGC
+select count(distinct NE_NAME) as Number_of_Nodes from DIM_E_CN_NSDS where STATUS = 'ACTIVE';CORE;vNSDS

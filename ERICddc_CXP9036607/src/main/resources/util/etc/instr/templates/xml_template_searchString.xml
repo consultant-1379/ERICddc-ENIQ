@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<instr xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="/opt/ericsson/ERICddc/util/etc/instr/schemas/instr.xsd">
+    <createdBy>Ciaran Johnston</createdBy>
+    <profile name="3PP-Profile">
+        <description>A profiler for 3PP applications</description>
+        <pollInterval>60</pollInterval>
+        <provider type="jmx" name="NameService">
+            <searchString>.* NameService</searchString>
+            <metricGroup name="jvm-memory">
+                <mbeanName>java.lang:type=Memory</mbeanName>
+                <metric name="ObjectPendingFinalizationCount" />
+                <compositeMetric name="HeapMemoryUsage">
+                    <metric name="committed" />
+                </compositeMetric>
+            </metricGroup>
+        </provider>
+        <provider type="jmx" name="ExtNameService">
+            <searchString>.* ExtNameService</searchString>
+            <metricGroup name="threads">
+                <mbeanName>java.lang:type=Threading</mbeanName>
+                <metric name="ThreadCount" />
+                <metric name="PeakThreadCount" />
+            </metricGroup>
+        </provider>
+    </profile>
+</instr>

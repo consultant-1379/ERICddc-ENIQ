@@ -1,0 +1,379 @@
+#!/bin/bash
+# *********************************************************************
+# Ericsson Radio Systems AB SCRIPT
+# *********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2017 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : manageSanDataCollection.bsh
+# Date    : 13/04/2023
+# Revision: A.1
+# Purpose : This script will enable automatic collection for san.
+#
+# Usage   : manageSanDataCollection.bsh
+#
+# ********************************************************************
+
+# ********************************************************************
+# Command Variables
+# ********************************************************************
+
+CAT=/usr/bin/cat
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+ECHO=/usr/bin/echo
+EGREP=/usr/bin/egrep
+GREP=/usr/bin/grep
+RM=/usr/bin/rm
+SLEEP=/usr/bin/sleep
+TOUCH=/usr/bin/touch
+TAIL=/usr/bin/tail
+HEAD=/usr/bin/head
+AWK=/usr/bin/awk
+HOSTNAME=$(hostname)
+
+ENIQ_BASE_DIR=/eniq
+# Main Directory for the Core Installation SW
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+
+# ENIQ Config Directory
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+SCRIPTNAME=$(basename "$0")
+
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+## Function: log_msg ###
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+log_msg() {
+    timestamp=$($DATE '+%Y-%m-%d %H:%M:%S')
+    ${ECHO} "${timestamp} ${HOSTNAME} ${1}" >> "$LOGFILE"
+}
+
+################ READ STORGAE TYPE ##################
+## Function: read_storage_type ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   NONE
+
+read_storage_type() {
+    if [ -s "${ENIQ_CONF_DIR}/san_details" ]; then
+        HARDWARE_TYPE=$($CAT "${ENIQ_CONF_DIR}/san_details" | $GREP "^STORAGE_TYPE=" | $AWK -F= "{print \$2}")
+    fi
+    if [ ! "${HARDWARE_TYPE}" ] ; then
+        log_msg "INFO: Could not determine the hardware type."
+        exit 0
+    elif [ "${HARDWARE_TYPE}" = "zfs" ] ; then
+        log_msg "INFO: The hardware type is rack. Exiting..."
+        exit 0
+    fi
+}
+
+################ VALIDATE SERVER ##################
+## Function: validate_server ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   NONE
+validate_server() {
+    INSTALLED_SERVER_TYPE=$($CAT ${ENIQ_CONF_DIR}/installed_server_type)
+    if [ "${INSTALLED_SERVER_TYPE}" != "eniq_coordinator" ] &&  [ "${INSTALLED_SERVER_TYPE}" != "eniq_events" ] && [ "${INSTALLED_SERVER_TYPE}" != "stats_coordinator" ] && [ "${INSTALLED_SERVER_TYPE}" != "eniq_stats" ]; then
+        log_msg "INFO: The installed server type is ${INSTALLED_SERVER_TYPE}.Exiting..."
+        exit 0
+    fi
+}
+
+################ Check first run ###############
+## Function: check_first_run ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_first_run() {
+    _first_run_="true"
+    for san_ip in ${SPA} ; do
+        if [ -f "${ENIQ_BASE_DIR}/log/assureddc/.analyzer_running_$san_ip" ] ; then
+            _first_run_="false"
+        fi
+    done
+}
+
+################ CONFIGURE ANALYZER COMMAND ##################
+## Function: configure_analyzer_cmd ###
+#
+# Arguments:
+#   none
+# Return Values:
+configure_analyzer_cmd() {
+    export CMD="/opt/Navisphere/bin/naviseccli"
+    if [ "${SAN_DEVICE}" == "clariion" ]; then
+        log_msg "INFO: Configuring analyzer command for ${SAN_DEVICE}"
+        SPA=$($EGREP -i 'spa' /ericsson/storage/san/plugins/clariion/etc/clariion.conf | $CUT -d = -f 2 | $CUT -d \' -f 2)
+        export SECFILEPATH="/ericsson/storage/san/plugins/clariion/cred"
+    elif [ "${SAN_DEVICE}" == "vnx" ]; then
+        log_msg "INFO: Configuring analyzer command for ${SAN_DEVICE}"
+        SPA=$($EGREP -i 'spa' /ericsson/storage/san/plugins/vnx/etc/clariion.conf | $CUT -d = -f 2 | $CUT -d \' -f 2)
+        export SECFILEPATH="/ericsson/storage/san/plugins/vnx/cred"
+    fi
+}
+
+################ RUN ANALYZER COMMAND ##################
+## Function: run_analyzer_cmd ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   NONE
+run_analyzer_cmd() {
+    log_msg "INFO: Executing Naviseccli to run analyzer commands on SPA"
+    if [ "${SAN_DEVICE}" == "clariion" ]; then
+        for san_ip in ${SPA} ; do
+            $CMD -Address "$san_ip" -secfilepath "$SECFILEPATH" analyzer -set -logperiod 7 -narinterval 60 >> /dev/null 2>&1
+            $CMD -Address "$san_ip" -secfilepath "$SECFILEPATH" analyzer -start >> /dev/null 2>&1
+            log_msg "INFO: Executed Naviseccli analyzer command on $san_ip"
+            $TOUCH /eniq/log/assureddc/.analyzer_running_"$san_ip"
+        done
+    elif [ "${SAN_DEVICE}" == "vnx" ]; then
+        for san_ip in ${SPA} ; do
+            $CMD -Address "$san_ip" -secfilepath "${SECFILEPATH}" analyzer -set -nonstop -periodicarchiving 1 -narinterval 60 >> /dev/null 2>&1
+            $CMD -Address "$san_ip" -secfilepath "${SECFILEPATH}" analyzer -start >> /dev/null 2>&1
+            log_msg "INFO: Executed Naviseccli analyzer command on $san_ip"
+            $TOUCH /eniq/log/assureddc/.analyzer_running_"$san_ip"
+        done
+    else
+        _err_msg_="ERROR: Storage device is other than other than clariion or vnx. Exiting script..."
+        log_msg  "${_err_msg_}" "${LOGFILE}"
+        exit 0
+    fi
+}
+
+################ Check Naviseccli analyzer status ##################
+## Function: check_analyzer_status ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_analyzer_status() {
+    log_msg "INFO: Checking Naviseccli analyzer status for SPA"
+    for san_ip in ${SPA} ; do
+        _analyzer_status_=$($CMD -Address "$san_ip" -secfilepath "${SECFILEPATH}" analyzer -status |  cut -f 1 -d " ")
+        log_msg "INFO: Naviseccli analyzer status is: ${_analyzer_status_} on $san_ip"
+        if [ "${_analyzer_status_}" == "Running." ]; then
+            log_msg "INFO: Stopping Naviseccli analyzer to restart it."
+            $CMD -Address "$san_ip" -secfilepath "${SECFILEPATH}" analyzer -stop >> /dev/null 2>&1
+            $SLEEP 30
+        elif [ "${_analyzer_status_}" == "Stopped" ]; then
+            log_msg "INFO: Naviseccli Analyzer is already stopped."
+        else
+            log_msg "ERROR: Naviseccli Analyzer is not in proper state.Exiting script..."
+            exit 0
+        fi
+    done
+}
+
+################ Check Naviseccli Analyzer License Status ##################
+## Function: check_license_status ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_license_status() {
+    ${RM} -f /tmp/license_status_inactive.txt
+    ${RM} -f /tmp/analyzer_status_inactive.txt
+    for san_ip in ${SPA} ; do
+        _analyzer_status_=$($CMD -Address "$san_ip" -secfilepath "${SECFILEPATH}" analyzer -status |  cut -f 1 -d " ")
+        $CMD -secfilepath "$SECFILEPATH" -h "$san_ip" getall -host > /tmp/san_analyzer_license_"$san_ip".txt
+        ${CAT} /tmp/san_analyzer_license_"$san_ip".txt | while read -r LINE
+        do
+        if [[ "$LINE" =~ "UnisphereAnalyzer" ]] ; then
+            _line_number_=$(${GREP} -n UnisphereAnalyzer /tmp/san_analyzer_license_"$san_ip".txt | ${AWK} -F: "{print $1}")
+            _status__line_number_=$((_line_number_ + 4))
+            _license_status_=$(${HEAD} -"${_status__line_number_}" /tmp/san_analyzer_license_"$san_ip".txt | ${TAIL} -1)
+            if [[ "${_license_status_}" =~ "Active State" ]] ; then
+                log_msg "INFO: License is Active for $san_ip"
+            else
+                ${TOUCH} /tmp/license_status_inactive.txt
+            fi
+        fi
+        done
+        if [[ "${_analyzer_status_}" == "Stopped" ]]; then
+            log_msg "INFO: Analyzer is stopped."
+            ${TOUCH} /tmp/analyzer_status_inactive.txt
+        fi
+    done
+
+    if [[ -f "/tmp/license_status_inactive.txt" ]] || [[ -f "/tmp/analyzer_status_inactive.txt" ]]; then
+        log_msg "INFO: Analyzer not active for SAN. Analyzer commands need to be re-executed."
+    else
+        log_msg "INFO: Analyzer is active. But analyzer commands need to be re-executed with DDC restart."
+    fi
+}
+
+################ Restart DDC Service ##################
+## Function: restart_ddc_service ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+restart_ddc_service() {
+    DDC_SERVICE_STATUS=$(service ddc status | $GREP DDC | $AWK "{print $2}")
+    if [ "${DDC_SERVICE_STATUS}" == "not" ]; then
+        log_msg "INFO: Starting DDC service."
+        service ddc start
+    elif [ "${DDC_SERVICE_STATUS}" == "running" ]; then
+        log_msg "INFO: Restarting DDC service"
+        service ddc restart
+    else
+        ERR_MSG="ERROR: DDC service is in ${DDC_SERVICE_STATUS} state. Re-starting... "
+        log_msg  "${ERR_MSG}"
+        service ddc start
+    fi
+}
+
+
+################ Disable SAN data collection ##################
+## Function: disable_san_data_collection ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+disable_san_data_collection() {
+    log_msg "INFO: Disabling san data collection..."
+    $RM -f /eniq/log/ddc_data/config/MONITOR_CLARIION
+    $RM -f /eniq/log/assureddc/.analyzer_running_*
+    restart_ddc_service "$@"
+    exit 0
+}
+
+################ Creates flag file required for SAN data collection ##################
+## Function: create_san_monitoring_flag_file ###
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_san_monitoring_flag_file() {
+    if [ -d "/eniq/log/ddc_data" ]; then
+        log_msg "INFO: Creating flag file in /eniq/log/ddc_data/config/."
+        $TOUCH /eniq/log/ddc_data/config/MONITOR_CLARIION
+        if ! $TOUCH /eniq/log/ddc_data/config/MONITOR_CLARIION; then
+            _err_msg_="ERROR: Could not create flag file /eniq/log/ddc_data/config/MONITOR_CLARIION. Exiting..."
+            log_msg  "${_err_msg_}"
+            exit 0
+        fi
+    else
+        log_msg "INFO: /eniq/log directory not present on the server, creating flag file in /var/tmp/ddc_data/config/."
+        if [ ! -d /var/tmp/ddc_data/config ] ; then
+            mkdir -p /var/tmp/ddc_data/config
+        fi
+        $TOUCH /var/tmp/ddc_data/config/MONITOR_CLARIION
+        if ! $TOUCH /var/tmp/ddc_data/config/MONITOR_CLARIION; then
+            _err_msg_="ERROR: Could not create flag file /var/tmp/ddc_data/config/MONITOR_CLARIION. Exiting..."
+            log_msg  "${_err_msg_}"
+            exit 0
+        fi
+    fi
+}
+
+############## Function: Main ###############################################
+#                                                                           #
+# Description:  Runs the script                                             #
+#                                                                           #
+#############################################################################
+
+usage() {
+    cat <<EOF
+Usage: $0 -m <enable/disable> -l <logfile>
+
+Where:
+     -m <enable/disable>: The option to enable/disable diagnostic data collection for SAN.
+
+     -l <logfile path>: The logfile to which this script will log.
+
+Example:
+$0 -l <logfile name(optional)> -m <enable/disable>
+
+EOF
+    exit 1
+}
+
+while getopts l:m: arg; do
+    case $arg in
+    l) LOGFILE="$OPTARG"
+        ;;
+    m) MANAGE="$OPTARG"
+        ;;
+    *) echo "usage: $0 [-l] [-m]" >&2
+       exit 1 ;;
+    esac
+done
+
+if [ -z "${MANAGE}" ] ; then
+    usage
+fi
+
+if [ -z "${LOGFILE}" ]; then
+    LOGFILE="${ENIQ_BASE_DIR}/log/assureddc/${SCRIPTNAME}.log"
+    $TOUCH "${LOGFILE}"
+    if ! $TOUCH "${LOGFILE}"; then
+        $ECHO "ERROR: Could not create logfile file ${LOGFILE}. Exiting..."
+    fi
+fi
+
+read_storage_type
+
+validate_server
+
+if [ "${MANAGE}" == "disable" ] ; then
+    disable_san_data_collection "$@"
+elif [ "${MANAGE}" == "enable" ] ; then
+    if [ "${HARDWARE_TYPE}" == "raw" ]; then
+        log_msg "INFO: Checking SAN device name from config file."
+        SAN_DEVICE=$($CAT ${ENIQ_CONF_DIR}/san_details | $GREP "^SAN_DEVICE=" | $AWK -F= "{print \$2}")
+        if [ "${SAN_DEVICE}" == "clariion" ] || [ "${SAN_DEVICE}" == "vnx" ]; then
+            log_msg "INFO: SAN device name is ${SAN_DEVICE}."
+            create_san_monitoring_flag_file
+            configure_analyzer_cmd
+            check_first_run
+            if [ ${_first_run_} == "false" ]; then
+                check_license_status "$@"
+            fi
+            check_analyzer_status
+            run_analyzer_cmd
+            restart_ddc_service "$@"
+        else
+            _err_msg_="INFO: Could not read valid SAN_DEVICE value from ${ENIQ_CONF_DIR}/san_details"
+            log_msg "${_err_msg_}"
+            exit 0
+        fi
+    fi
+else
+    $ECHO "Invalid option..."
+    usage
+fi
+
+exit 0
+
+
